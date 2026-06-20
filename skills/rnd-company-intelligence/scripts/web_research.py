@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""
+web_research.py — multi-engine web research tool with fallback and academic engine support.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from urllib.parse import urlparse, quote_plus
+
+DEFAULT_TIMEOUT = 15
+USER_AGENT = "Mozilla/5.0 (compatible; rnd-research/1.0; mailto:team@research-tool.local)"
+
+# Updated to include academic and code repository engines
+ALL_SEARCH_ENGINES = [
+    "ddg", "bing", "brave", "mojeek", "google-cse", 
+    "arxiv", "crossref", "semantic-scholar", "github"
+]
+
+
+# =========================================================
+# CORE FALLBACK ENGINE
+# =========================================================
+
+def _search_ddg(query: str, limit: int, region="us-en"):
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        # Fallback if duckduckgo_search library isn't installed
+        import requests
+        resp = requests.get(
+            f"https://html.duckduckgo.com/html/?q={quote_plus(query)}",
+            headers={"User-Agent": USER_AGENT},
+            timeout=DEFAULT_TIMEOUT
+        )
+        # Basic parsing stub or return empty if library missing
+        return []
+
+    results = []
+    with DDGS() as ddgs:
+        hits = ddgs.text(query, region=region, max_results=limit)
+
+    for h in hits:
+        results.append({
+            "engine": "ddg",
+            "title": h.get("title", ""),
+            "url": h.get("href") or h.get("url", ""),
+            "snippet": h.get("body", "")
+        })
+    return results
+
+
+def _ddg_fallback(engine: str, query: str, limit: int):
+    """Universal fallback for ALL engines without API keys or when failure occurs"""
+    try:
+        results = _search_ddg(query, limit)
+        for r in results:
+            r["engine"] = f"{engine}-fallback-ddg"
+        return results
+    except Exception:
+        return []
+
+
+# =========================================================
+# NEW ENGINES: ACADEMIC & CODE REPOSITORIES
+# =========================================================
+
+def _search_arxiv(query: str, limit: int):
+    import requests
+    import xml.etree.ElementTree as ET
+
+    url = f"http://export.arxiv.org/api/query?search_query=all:{quote_plus(query)}&max_results={limit}"
+    resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=DEFAULT_TIMEOUT)
+    if resp.status_code != 200:
+        return []
+
+    root = ET.fromstring(resp.text)
+    # Handle Atom feed namespaces
+    ns = {'atom': 'http://www.w3.org/2005/Atom'}
+    
+    results = []
+    for entry in root.findall('atom:entry', ns):
+        title = entry.find('atom:title', ns)
+        id_url = entry.find('atom:id', ns)
+        summary = entry.find('atom:summary', ns)
+        
+        results.append({
+            "engine": "arxiv",
+            "title": title.text.strip().replace("\n", " ") if title is not None else "",
+            "url": id_url.text.strip() if id_url is not None else "",
+            "snippet": summary.text.strip().replace("\n", " ") if summary is not None else ""
+        })
+    return results
+
+
+def _search_crossref(query: str, limit: int):
+    import requests
+    url = "https://api.crossref.org/works"
+    params = {"query": query, "rows": limit}
+    
+    resp = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=DEFAULT_TIMEOUT)
+    if resp.status_code != 200:
+        return []
+    
+    data = resp.json()
+    items = data.get("message", {}).get("items", [])
+    
+    results = []
+    for item in items:
+        title = item.get("title", [""])[0] if item.get("title") else ""
+        url = item.get("URL", "")
+        
+        # CrossRef structure abstracts poorly, piece together metadata as snippet
+        publisher = item.get("publisher", "")
+        container = item.get("container-title", [""])[0] if item.get("container-title") else ""
+        snippet = f"Published in {container} by {publisher}" if container else publisher
+
+        results.append({
+            "engine": "crossref",
+            "title": title,
+            "url": url,
+            "snippet": snippet
+        })
+    return results
+
+
+def _search_semantic_scholar(query: str, limit: int):
+    import requests
+    url = "https://api.semanticscholar.org/graph/v1/paper/search"
+    params = {"query": query, "limit": limit, "fields": "title,url,abstract"}
+    
+    # Semantic Scholar allows public unauthenticated requests with lower rate-limits
+    headers = {"User-Agent": USER_AGENT}
+    api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
+    if api_key:
+        headers["x-api-key"] = api_key
+
+    resp = requests.get(url, params=params, headers=headers, timeout=DEFAULT_TIMEOUT)
+    if resp.status_code != 200:
+        return []
+
+    data = resp.json()
+    return [
+        {
+            "engine": "semantic-scholar",
+            "title": item.get("title", ""),
+            "url": item.get("url", "") or f"https://www.semanticscholar.org/paper/{item.get('paperId')}",
+            "snippet": item.get("abstract", "") or ""
+        }
+        for item in data.get("data", [])
+    ]
+
+
+def _search_github(query: str, limit: int):
+    import requests
+    # GitHub Search API requires specific header acceptability
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/vnd.github+json"
+    }
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    url = "https://api.github.com/search/repositories"
+    params = {"q": query, "per_page": limit}
+
+    resp = requests.get(url, params=params, headers=headers, timeout=DEFAULT_TIMEOUT)
+    if resp.status_code != 200:
+        # Fall back gracefully if rate-limited by unauthenticated API thresholds
+        return _ddg_fallback("github", query, limit)
+
+    data = resp.json()
+    return [
+        {
+            "engine": "github",
+            "title": item.get("full_name", ""),
+            "url": item.get("html_url", ""),
+            "snippet": item.get("description", "") or f"Stars: {item.get('stargazers_count')}"
+        }
+        for item in data.get("items", [])[:limit]
+    ]
+
+
+# =========================================================
+# STANDARD WEB ENGINES
+# =========================================================
+
+def _search_bing(query: str, limit: int):
+    key = os.environ.get("BING_SEARCH_API_KEY")
+    if not key:
+        return _ddg_fallback("bing", query, limit)
+
+    import requests
+    resp = requests.get(
+        "https://api.bing.microsoft.com/v7.0/search",
+        headers={"Ocp-Apim-Subscription-Key": key},
+        params={"q": query, "count": min(limit, 50)},
+        timeout=DEFAULT_TIMEOUT,
+    )
+    data = resp.json()
+    return [
+        {
+            "engine": "bing",
+            "title": i.get("name", ""),
+            "url": i.get("url", ""),
+            "snippet": i.get("snippet", ""),
+        }
+        for i in data.get("webPages", {}).get("value", [])[:limit]
+    ]
+
+
+def _search_brave(query: str, limit: int):
+    key = os.environ.get("BRAVE_SEARCH_API_KEY")
+    if not key:
+        return _ddg_fallback("brave", query, limit)
+
+    import requests
+    resp = requests.get(
+        "https://api.search.brave.com/res/v1/web/search",
+        headers={"X-Subscription-Token": key},
+        params={"q": query, "count": min(limit, 20)},
+        timeout=DEFAULT_TIMEOUT,
+    )
+    data = resp.json()
+    return [
+        {
+            "engine": "brave",
+            "title": i.get("title", ""),
+            "url": i.get("url", ""),
+            "snippet": i.get("description", ""),
+        }
+        for i in data.get("web", {}).get("results", [])[:limit]
+    ]
+
+
+def _search_mojeek(query: str, limit: int):
+    key = os.environ.get("MOJEEK_API_KEY")
+    if not key:
+        return _ddg_fallback("mojeek", query, limit)
+
+    import requests
+    resp = requests.get(
+        "https://www.mojeek.com/api/search",
+        params={"q": query, "api_key": key, "t": limit},
+        timeout=DEFAULT_TIMEOUT,
+    )
+    data = resp.json()
+    return [
+        {
+            "engine": "mojeek",
+            "title": i.get("title", ""),
+            "url": i.get("url", ""),
+            "snippet": i.get("desc", ""),
+        }
+        for i in data.get("response", {}).get("results", [])[:limit]
+    ]
+
+
+def _search_google_cse(query: str, limit: int):
+    api_key = os.environ.get("GOOGLE_CSE_API_KEY")
+    cse_id = os.environ.get("GOOGLE_CSE_ID")
+
+    if not api_key or not cse_id:
+        return _ddg_fallback("google-cse", query, limit)
+
+    import requests
+    out = []
+    start = 1
+    while len(out) < limit:
+        resp = requests.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params={
+                "key": api_key,
+                "cx": cse_id,
+                "q": query,
+                "num": min(10, limit - len(out)),
+                "start": start,
+            },
+            timeout=DEFAULT_TIMEOUT,
+        )
+        data = resp.json()
+        items = data.get("items", [])
+        if not items:
+            break
+
+        for i in items:
+            out.append({
+                "engine": "google-cse",
+                "title": i.get("title", ""),
+                "url": i.get("link", ""),
+                "snippet": i.get("snippet", ""),
+            })
+        start += 10
+    return out
+
+
+# =========================================================
+# ENGINE ROUTER
+# =========================================================
+
+def cmd_web_search(args):
+    # Setting default engine value to "all" routes queries sequentially through everything
+    engines = ALL_SEARCH_ENGINES if args.engine == "all" else [args.engine]
+
+    results = []
+    errors = {}
+
+    for e in engines:
+        try:
+            if e == "ddg":
+                results.extend(_search_ddg(args.query, args.limit))
+            elif e == "bing":
+                results.extend(_search_bing(args.query, args.limit))
+            elif e == "brave":
+                results.extend(_search_brave(args.query, args.limit))
+            elif e == "mojeek":
+                results.extend(_search_mojeek(args.query, args.limit))
+            elif e == "google-cse":
+                results.extend(_search_google_cse(args.query, args.limit))
+            elif e == "arxiv":
+                results.extend(_search_arxiv(args.query, args.limit))
+            elif e == "crossref":
+                results.extend(_search_crossref(args.query, args.limit))
+            elif e == "semantic-scholar":
+                results.extend(_search_semantic_scholar(args.query, args.limit))
+            elif e == "github":
+                results.extend(_search_github(args.query, args.limit))
+        except Exception as exc:
+            errors[e] = str(exc)
+
+    # Global cross-engine deduplication by URL
+    seen = set()
+    deduped = []
+    for r in results:
+        k = r.get("url", "")
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        deduped.append(r)
+
+    return {
+        "query": args.query,
+        "engines_attempted": engines,
+        "errors": errors,
+        "count": len(deduped),
+        "results": deduped[:args.limit],
+    }
+
+
+# =========================================================
+# CLI CONFIGURATION
+# =========================================================
+
+def build_parser():
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("web-search")
+    s.add_argument("--query", required=True)
+    s.add_argument("--engine", default="all", choices=ALL_SEARCH_ENGINES + ["all"])
+    s.add_argument("--limit", type=int, default=10)
+    s.set_defaults(func=cmd_web_search)
+
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        out = args.func(args)
+        print(json.dumps(out, indent=2))
+    except Exception as e:
+        print(json.dumps({"error": str(e)}))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
