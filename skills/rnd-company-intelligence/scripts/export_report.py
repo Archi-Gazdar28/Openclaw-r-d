@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-export_report.py  —  OpenClaw R&D Intelligence Report Exporter  v3.0
+export_report.py  —  OpenClaw R&D Intelligence Report Exporter  v3.1
 Generates a self-contained HTML report with embedded charts.
-Open in browser → click "Download PDF" to save.
+Supports automatic downloading from remote servers to a local machine via SCP.
 
-Usage (unchanged from v2):
+Usage (Normal Server/Local):
     python3 export_report.py export \
-        --format pdf \
         --title  "R&D Intelligence Report: Tonometer by Haag-Streit" \
         --input  ~/.openclaw/workspace/reports/haagstriet_tonometer_2026-06-22/report.json \
         --output ~/.openclaw/workspace/reports/haagstriet_tonometer_2026-06-22/report.html
 
-Or use --auto-open to launch the browser immediately after generation:
-    python3 export_report.py export ... --auto-open
+Usage (With auto-download to your local machine):
+    python3 export_report.py export \
+        --title  "R&D Intelligence Report: Tonometer by Haag-Streit" \
+        --input  ~/.openclaw/workspace/reports/haagstriet_tonometer_2026-06-22/report.json \
+        --output ~/.openclaw/workspace/reports/haagstriet_tonometer_2026-06-22/report.html \
+        --download-to "your_local_username@your_local_ip:~/Downloads/"
 """
 
-import argparse, json, os, sys, webbrowser
+import argparse, json, os, sys, webbrowser, subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -76,7 +79,6 @@ def build_company(data):
     ]
     html = kv_rows(pairs)
 
-    # people
     people = profile.get("people",[]) if isinstance(profile,dict) else []
     if people and isinstance(people,list):
         rows = ""
@@ -132,7 +134,7 @@ def build_turnover(data):
       responsive: true, maintainAspectRatio: false,
       plugins: {{ legend: {{ display: false }} }},
       scales: {{ y: {{ beginAtZero: true, ticks: {{ color: '#888' }}, grid: {{ color: 'rgba(0,0,0,0.06)' }} }},
-                 x: {{ ticks: {{ color: '#888' }}, grid: {{ display: false }} }} }}
+                x: {{ ticks: {{ color: '#888' }}, grid: {{ display: false }} }} }}
     }}
   }});
 }})();
@@ -149,7 +151,6 @@ def build_patents(data):
     total = safe(pt,"count",default=str(len(patents_list) if isinstance(patents_list,list) else 0))
     html = f'<p class="sub-note">Total records: <strong>{esc(total)}</strong></p>'
 
-    # tech area pie chart
     tech = pt.get("tech_areas",[])
     if tech and isinstance(tech,list) and len(tech) >= 2:
         labels = [str(t) for t in tech[:8]]
@@ -254,7 +255,6 @@ def build_trends(data):
 }})();
 </script>'''
 
-    # related queries
     rq = tr.get("related_queries",{})
     if isinstance(rq,dict):
         for grp, items in rq.items():
@@ -275,7 +275,6 @@ def build_competitors(data):
     count = len(competitors_list) if isinstance(competitors_list,list) else 0
     html = f'<p class="sub-note">Market peers identified: <strong>{count}</strong></p>'
 
-    # bar chart of named companies (non-market-report entries)
     named = [c for c in (competitors_list or []) if isinstance(c,dict) and
              safe(c,"name") not in ("—",) and
              not any(x in safe(c,"name","").lower() for x in ["market size","market share","report","forecast","industry"])]
@@ -289,7 +288,6 @@ def build_competitors(data):
             fund  = safe(c,"funding_usd")
             found = safe(c,"founded")
             url_html = f'<a href="{esc(url)}" target="_blank">{esc(url)}</a>' if url != "—" else ""
-            pairs = [("Website",url_html if url != "—" else ""),("Funding",fund),("Founded",found)]
             meta_html = "".join(f'<span class="card-kv"><span>{esc(k)}</span>{v}</span>' for k,v in [("Funding",fund),("Founded",found)] if v and v != "—")
             html += f'''
 <div class="info-card">
@@ -300,7 +298,6 @@ def build_competitors(data):
 </div>'''
         html += '</div>'
     else:
-        # market reports as table
         rows = ""
         for c in (competitors_list or []):
             if isinstance(c,dict):
@@ -321,7 +318,6 @@ def build_research(data):
     count  = safe(rp,"count",default=str(len(papers) if isinstance(papers,list) else 0))
     html   = f'<p class="sub-note">Academic papers retrieved: <strong>{esc(count)}</strong></p>'
 
-    # citation count bar chart
     citable = [(safe(p,"title"), safe(p,"cited_by")) for p in (papers or []) if isinstance(p,dict)]
     citable = [(t[:40]+"…" if len(t)>40 else t, c) for t,c in citable if c and c != "—"]
     try:
@@ -393,7 +389,7 @@ def build_quality(data):
     found = False
     html  = '<p>Automatically logged by the OpenClaw intelligence pipeline.</p>'
     for key, label in section_map.items():
-        sec  = data.get(key,{})
+        sec   = data.get(key,{})
         gaps = flatten_gaps(sec.get("data_gaps") if isinstance(sec,dict) else None)
         if gaps:
             found = True
@@ -464,24 +460,20 @@ h3{{font-size:15px;font-weight:600;color:var(--ink2);margin:1.2rem 0 .5rem}}
 p{{color:var(--ink2);margin:.4rem 0}}
 strong{{font-weight:600}}
 
-/* ── layout ── */
 .page{{max-width:900px;margin:0 auto;padding:2rem 1.5rem 4rem}}
 
-/* ── cover ── */
 .cover{{padding:3rem 0 2.5rem;border-bottom:1px solid var(--rule);margin-bottom:2.5rem}}
 .cover-eyebrow{{font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink4);margin-bottom:.6rem}}
 .cover-title{{font-size:30px;font-weight:700;line-height:1.25;color:var(--ink);margin-bottom:.8rem}}
 .cover-meta{{font-size:13px;color:var(--ink3)}}
 .cover-tags{{display:flex;gap:8px;flex-wrap:wrap;margin:.8rem 0}}
 
-/* ── download button ── */
 .dl-btn{{display:inline-flex;align-items:center;gap:6px;background:var(--accent);
   color:#fff;padding:.5rem 1.1rem;border-radius:var(--radius);font-size:14px;
   font-weight:500;cursor:pointer;border:none;margin-top:1.2rem;transition:opacity .15s}}
 .dl-btn:hover{{opacity:.88}}
 .dl-btn svg{{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}}
 
-/* ── toc ── */
 .toc{{background:var(--bg2);border:1px solid var(--rule);border-radius:var(--radius);padding:1.2rem 1.5rem;margin-bottom:2.5rem}}
 .toc h2{{font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink3);margin-bottom:.7rem}}
 .toc ol{{list-style:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:4px}}
@@ -489,25 +481,21 @@ strong{{font-weight:600}}
 .toc a:hover{{color:var(--accent)}}
 .toc-num{{font-size:11px;font-weight:600;color:var(--ink4);min-width:16px}}
 
-/* ── sections ── */
 section{{margin-bottom:2.8rem}}
 .sec-header{{display:flex;align-items:center;gap:10px;margin-bottom:1rem;padding-bottom:.5rem;border-bottom:1.5px solid var(--rule)}}
 .sec-icon{{font-size:20px}}
 .sec-body{{}}
 
-/* ── kv table ── */
 .kv-table{{width:100%;border-collapse:collapse;margin:.6rem 0}}
 .kv-table tr:nth-child(even){{background:var(--bg2)}}
 .kv-label{{font-size:12px;font-weight:600;color:var(--ink3);padding:5px 10px 5px 0;width:140px;vertical-align:top}}
 .kv-val{{font-size:14px;color:var(--ink2);padding:5px 0;vertical-align:top}}
 
-/* ── data table ── */
 .data-table{{width:100%;border-collapse:collapse;font-size:13px;margin:.8rem 0}}
 .data-table th{{background:var(--bg3);font-weight:600;color:var(--ink2);text-align:left;padding:7px 10px;border-bottom:1px solid var(--rule)}}
 .data-table td{{padding:6px 10px;border-bottom:.5px solid var(--rule);color:var(--ink2);vertical-align:top}}
 .data-table tr:hover td{{background:var(--bg2)}}
 
-/* ── cards ── */
 .card-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin:.8rem 0}}
 .info-card{{background:var(--bg);border:1px solid var(--rule);border-radius:var(--radius);padding:.9rem 1rem}}
 .card-title{{font-size:13.5px;font-weight:600;color:var(--ink);line-height:1.4;margin-bottom:4px}}
@@ -517,17 +505,14 @@ section{{margin-bottom:2.8rem}}
 .card-kv{{font-size:11.5px;color:var(--ink4)}}
 .card-kv span{{margin-right:3px;font-weight:600}}
 
-/* ── charts ── */
 .chart-wrap{{position:relative;width:100%;height:260px;margin:1rem 0 1.5rem}}
 .chart-wrap--sm{{height:200px}}
 
-/* ── badges ── */
 .badge{{font-size:10.5px;font-weight:600;padding:2px 7px;border-radius:20px;display:inline-block;margin-left:4px;vertical-align:middle}}
 .badge-default{{background:var(--bg3);color:var(--ink3)}}
 .badge-purple{{background:#ede9ff;color:#4a3eaa}}
 @media(prefers-color-scheme:dark){{.badge-purple{{background:#2e2860;color:#c3b9ff}}}}
 
-/* ── misc ── */
 .muted{{color:var(--ink3);font-style:italic}}
 .sub-note{{font-size:13px;color:var(--ink3);margin-bottom:.6rem}}
 .gap-box{{background:#fff8f0;border-left:3px solid #e5890a;border-radius:0 var(--radius) var(--radius) 0;
@@ -541,7 +526,6 @@ section{{margin-bottom:2.8rem}}
 .tag-list{{display:flex;flex-wrap:wrap;gap:6px;list-style:none;margin:.4rem 0}}
 .tag-list li{{font-size:12px;background:var(--bg3);color:var(--ink2);padding:3px 10px;border-radius:20px}}
 
-/* ── print ── */
 @media print{{
   .dl-btn,.toc{{display:none}}
   .page{{padding:0}}
@@ -582,7 +566,7 @@ section{{margin-bottom:2.8rem}}
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="OpenClaw report exporter v3.0")
+    parser = argparse.ArgumentParser(description="OpenClaw report exporter v3.1")
     sub = parser.add_subparsers(dest="command")
 
     ep = sub.add_parser("export")
@@ -591,6 +575,7 @@ def main():
     ep.add_argument("--input",       required=True)
     ep.add_argument("--output",      required=True)
     ep.add_argument("--auto-open",   action="store_true", help="Open in browser after export")
+    ep.add_argument("--download-to", default=None, help="Local target for download, format: user@local_ip:/path/to/dest/")
     # legacy flags (ignored, kept for backward compat)
     ep.add_argument("--markdown-file", default=None)
     ep.add_argument("--charts-dir",    default=None)
@@ -604,12 +589,10 @@ def main():
     inp = os.path.expanduser(args.input)
     out = os.path.expanduser(args.output)
 
-    # If --out-dir used (legacy), derive output path
     if args.out_dir and not args.output:
         out = os.path.join(os.path.expanduser(args.out_dir),
                            Path(inp).stem + ".html")
 
-    # Always write .html
     if not out.endswith(".html"):
         out = Path(out).with_suffix(".html").as_posix()
 
@@ -630,10 +613,22 @@ def main():
     with open(out, "w", encoding="utf-8") as f:
         f.write(html)
 
-    print(f"[export_report] HTML report → {out}")
-    print(f"[export_report] Open in browser → click 'Download PDF' to save")
+    print(f"[export_report] HTML report generated -> {out}")
 
-    if args.auto_open:
+    # ── Remote Transfer Phase ────────────────────────────────────────────────
+    if args.download_to:
+        print(f"[export_report] Initiating transfer to local destination: {args.download_to}...")
+        try:
+            # Wrap standard scp command down to target destination
+            # Explicitly wrapping the local absolute path in quotes to handle shell execution spaces safely
+            scp_cmd = ["scp", os.path.abspath(out), args.download_to]
+            subprocess.run(scp_cmd, check=True)
+            print(f"[export_report] Successfully downloaded report to local machine target!")
+        except subprocess.CalledProcessError as e:
+            print(f"[error] Automated download failed: {e}", file=sys.stderr)
+            print("[tip] Ensure SSH key configurations or passwords match target requirements.", file=sys.stderr)
+
+    if args.auto_open and not args.download_to:
         webbrowser.open(f"file://{os.path.abspath(out)}")
 
 if __name__ == "__main__":
