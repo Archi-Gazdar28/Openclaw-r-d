@@ -1,21 +1,10 @@
 #!/usr/bin/env python3
 """
 rnd_report.py  —  OpenClaw R&D Company Intelligence (Serper-Only Edition)
-Version: 2.1.0
+Version: 2.1.1
 
 Consolidated down to a single paid provider framework:
   • Serper.dev (SERPER_API_KEY) — Powers all lookups (Web, Patents, Scholar, News)
-
-Commands
---------
-  company-details    Company + product profile (via Serper Web Engine)
-  turnover           Financials: parsed via targeted stock/funding news crawls
-  patents            Google Patents via Serper Patents Engine
-  trends             Interest approximation via Serper News/Web velocity hints
-  competitors        Alternative mapping via Serper alternative engine strings
-  research-papers    Google Scholar via Serper Scholar Engine
-  tech-stack-detect  Stack detection via best-effort web index signature clues
-  full-report        Orchestrates all of the above, writes report.json to --output path
 """
 
 from __future__ import annotations
@@ -35,7 +24,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 SERPER_BASE = "https://google.serper.dev"
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": f"OpenClaw-rnd-report/{VERSION}"})
@@ -58,14 +47,14 @@ def _serper_post(endpoint: str, payload: dict, label: str) -> dict:
     url = f"{SERPER_BASE}/{endpoint}"
     headers = {
         "X-API-KEY": _env(),
-        "Content-Type": application/json"
+        "Content-Type": "application/json"  # Fixed: Added missing opening quote
     }
     try:
         r = _SESSION.post(url, headers=headers, json=payload, timeout=30)
     except requests.RequestException as exc:
         _die(f"Network error calling {label} via Serper: {exc}")
 
-    if r.status_code == 403 or r.status_code == 401:
+    if r.status_code in (401, 403):
         _die(f"Unauthorized/Invalid API key for {label} on Serper. Check your SERPER_API_KEY.")
     if r.status_code == 429:
         _die(f"Rate-limited by Serper dev tier on {label}. Please back off and retry.")
@@ -93,17 +82,6 @@ def _out(data: Any, output_path: str | None) -> None:
 
 def _today() -> str:
     return date.today().isoformat()
-
-
-# ---------------------------------------------------------------------------
-# Chart placeholders (Preserves structural typing for agent graphics logic)
-# ---------------------------------------------------------------------------
-
-def _charts_dir(output_path: str | None) -> Path:
-    base = Path(output_path).parent if output_path else Path.home() / ".openclaw" / "workspace" / "reports"
-    charts = base / "charts"
-    charts.mkdir(parents=True, exist_ok=True)
-    return charts
 
 
 # ---------------------------------------------------------------------------
@@ -145,9 +123,9 @@ def cmd_turnover(args: argparse.Namespace) -> dict:
     rows = []
 
     if is_pub:
-        q_term = f"{ticker or company} annual revenue financial revenue data statement site:macrotrends.net OR site:wsj.com"
+        q_term = f"{ticker or company} annual revenue financial statement site:macrotrends.net OR site:wsj.com"
         print(f"[turnover] Querying Serper for public financial profiles: {q_term}", file=sys.stderr)
-        data = _serper_post("search", {"q": q_term, "num": 5}, "Financial Metrics Analysis")
+        data = _serper_post("search", {"q": q_term}, "Financial Metrics Analysis")
         organic = data.get("organic", [])
         
         for idx, item in enumerate(organic[:3]):
@@ -158,9 +136,9 @@ def cmd_turnover(args: argparse.Namespace) -> dict:
                 "source": item.get("link"), "sourced_text_snippet": item.get("snippet")
             })
     else:
-        q_term = f"'{company}' funding valuation round crunchbase raised millions site:techcrunch.com OR site:venturebeat.com"
-        print(f"[turnover] Querying Serper for venture capital trends: {q_term}", file=sys.stderr)
-        data = _serper_post("search", {"q": q_term, "num": 5}, "Private Venture Analysis")
+        q_term = f"'{company}' funding valuation round raised millions site:techcrunch.com OR site:venturebeat.com"
+        print(f"[turnover] Querying Serper for private venture capital trends: {q_term}", file=sys.stderr)
+        data = _serper_post("search", {"q": q_term}, "Private Venture Analysis")
         organic = data.get("organic", [])
         
         for idx, item in enumerate(organic[:3]):
@@ -181,25 +159,25 @@ def cmd_turnover(args: argparse.Namespace) -> dict:
 def cmd_patents(args: argparse.Namespace) -> dict:
     company, product = args.company, args.product
     keywords = getattr(args, "keywords", "") or ""
-    limit = getattr(args, "limit", 50)
     
     q_term = f'assignee:"{company}" {product} {keywords}'.strip()
     print(f"[patents] Querying Serper Patents engine: {q_term}", file=sys.stderr)
     
-    data = _serper_post("patents", {"q": q_term, "num": min(limit, 100)}, "Patents Engine")
+    data = _serper_post("patents", {"q": q_term}, "Patents Engine")
     patents_raw = data.get("patents", [])
     
     normalized_patents = []
     for p in patents_raw:
+        pid = p.get("patentNumber") or p.get("id") or "UnknownID"
         normalized_patents.append({
-            "title": p.get("title"),
-            "patent_id": p.get("patentNumber"),
+            "title": p.get("title", "Untitled Patent"),
+            "patent_id": pid,
             "assignee": p.get("assignee"),
             "inventors": [p.get("inventor")] if p.get("inventor") else [],
             "publication_date": p.get("publicationDate"),
             "filing_date": None, "priority_date": None, "cpc_codes": [],
             "abstract_snippet": p.get("snippet"),
-            "link": p.get("link") or f"https://patents.google.com/patent/{p.get('patentNumber')}/en",
+            "link": p.get("link") or f"https://patents.google.com/patent/{pid}/en",
             "source": "Serper/patents API Engine"
         })
 
@@ -214,7 +192,7 @@ def cmd_trends(args: argparse.Namespace) -> dict:
     product = args.product
     print(f"[trends] Bypassing Google Trends via Serper News context analysis for '{product}'…", file=sys.stderr)
     
-    data = _serper_post("news", {"q": f"{product} market trends growth demand analytics"}, "News Signals")
+    data = _serper_post("news", {"q": f"{product} market trends growth"}, "News Signals")
     news_items = data.get("news", [])
     
     timeline_mock = []
@@ -238,7 +216,7 @@ def cmd_competitors(args: argparse.Namespace) -> dict:
     q_term = f"{product} alternatives competitors vs market options"
     print(f"[competitors] Sourcing peer ecosystems via Serper Search: {q_term}", file=sys.stderr)
     
-    data = _serper_post("search", {"q": q_term, "num": 10}, "Competitors Grid")
+    data = _serper_post("search", {"q": q_term}, "Competitors Grid")
     organic = data.get("organic", [])
     
     competitors = []
@@ -260,12 +238,11 @@ def cmd_competitors(args: argparse.Namespace) -> dict:
 def cmd_research_papers(args: argparse.Namespace) -> dict:
     product = args.product
     keywords = getattr(args, "keywords", "") or ""
-    limit = getattr(args, "limit", 20)
     
     q_term = f"{product} {keywords}".strip()
     print(f"[research-papers] Accessing Serper Scholar endpoint: {q_term}", file=sys.stderr)
     
-    data = _serper_post("scholar", {"q": q_term, "num": min(limit, 20)}, "Scholar Engine")
+    data = _serper_post("scholar", {"q": q_term}, "Scholar Engine")
     organic = data.get("organic", [])
     
     papers = []
@@ -291,7 +268,7 @@ def cmd_tech_stack_detect(args: argparse.Namespace) -> dict:
     domain = args.domain
     print(f"[tech-stack-detect] Analyzing public signatures for: {domain}", file=sys.stderr)
     
-    data = _serper_post("search", {"q": f'"{domain}" built with powered by powered framework technology'}, "Stack Inspection")
+    data = _serper_post("search", {"q": f'"{domain}" built with powered framework technology'}, "Stack Inspection")
     organic = data.get("organic", [])
     
     layers = []
@@ -404,8 +381,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g2 = p8.add_mutually_exclusive_group()
     g2.add_argument("--public", action="store_true")
     g2.add_argument("--private", action="store_true")
-    p8.add_argument("--keywords", default="")
-    p8.add_argument("--limit", type=int, default=50)
+    g2.add_argument("--keywords", default="")
+    g2.add_argument("--limit", type=int, default=50)
     p8.add_argument("--output", "-o", required=True)
 
     return root
