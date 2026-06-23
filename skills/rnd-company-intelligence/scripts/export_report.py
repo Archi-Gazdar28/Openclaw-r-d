@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 export_report.py — Tesla R&D Intelligence Report Generator (Exact Match Style)
-Generates a professional PDF matching the typography and exact dataset layout
-of the provided Tesla Model Y source text.
+Generates a professional PDF matching the typography and dataset layout
+of the provided Tesla Model Y source text, complete with automated data charts.
 
 Features:
 - Minimalist plain black/white/grey color palette (Grayscale branding)
 - Completely synchronized 8-Section Table of Contents with working internal hyperlinks
+- Dynamic inline Matplotlib vector graph generation matching the text dataset
 - Integrated PDF Bookmarks for native sidebar document outlines
 - Strict grid table margins, zero text collisions, and custom itemized listings
 - Dynamic single-pass footer construction with dynamic canvas page counts
@@ -17,6 +18,11 @@ import os
 import sys
 from pathlib import Path
 
+# Set Matplotlib backend to headless Agg prior to importing pyplot
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm, mm
 from reportlab.lib import colors
@@ -24,7 +30,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_CENTER
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    PageBreak, Flowable, HRFlowable
+    PageBreak, Flowable, HRFlowable, Image
 )
 
 # =============================================================================
@@ -124,6 +130,72 @@ def sp(h=6):
     return Spacer(1, h)
 
 # =============================================================================
+# Automated Dynamic Chart Generation (Grayscale / Minimalist)
+# =============================================================================
+def generate_report_charts():
+    """Generates the text matching figures and saves them as local temp files."""
+    # Apply global clean layout configs
+    plt.rcParams['font.family'] = 'sans-serif'
+    plt.rcParams['font.sans-serif'] = ['Helvetica', 'Arial']
+    plt.rcParams['text.color'] = '#2d2d2d'
+    plt.rcParams['axes.labelcolor'] = '#2d2d2d'
+    plt.rcParams['xtick.color'] = '#555555'
+    plt.rcParams['ytick.color'] = '#555555'
+
+    # Chart 1: Tesla Annual Revenue
+    years = ['2017', '2018', '2019', '2020', '2021', '2022', '2023', '2024E']
+    revenue = [11.8, 21.5, 24.6, 31.5, 53.8, 81.5, 96.8, 97.7]
+    fig, ax = plt.subplots(figsize=(6.5, 2.3))
+    bars = ax.bar(years, revenue, color='#2d2d2d', edgecolor='#1a1a1a', width=0.6)
+    ax.set_ylabel('Revenue ($B)', fontsize=9)
+    ax.set_title('Tesla Annual Revenue (USD)', fontsize=10, fontweight='bold', pad=8)
+    ax.grid(axis='y', linestyle=':', alpha=0.6, color='#cccccc')
+    ax.set_axisbelow(True)
+    for bar in bars:
+        yval = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2, yval + 2, f"${yval}B", ha='center', va='bottom', fontsize=7.5)
+    ax.set_ylim(0, 115)
+    plt.tight_layout()
+    plt.savefig("chart_revenue.png", dpi=300)
+    plt.close()
+
+    # Chart 2: Annual Vehicle Deliveries
+    deliv_years = ['2017', '2018', '2019', '2020', '2021', '2022', '2023', '2024']
+    deliveries = [103, 246, 368, 500, 936, 1314, 1809, 1789]
+    fig, ax = plt.subplots(figsize=(6.5, 2.3))
+    ax.plot(deliv_years, deliveries, color='#1a1a1a', marker='o', linewidth=2, markersize=5)
+    ax.fill_between(deliv_years, deliveries, color='#f5f5f5', alpha=1.0)
+    ax.set_ylabel('Vehicles (Thousands)', fontsize=9)
+    ax.set_title('Tesla Annual Vehicle Deliveries', fontsize=10, fontweight='bold', pad=8)
+    ax.grid(axis='y', linestyle=':', alpha=0.6, color='#cccccc')
+    for i, txt in enumerate(deliveries):
+        ax.annotate(f"{txt}K", (deliv_years[i], deliveries[i]), textcoords="offset points", xytext=(0,6), ha='center', fontsize=7.5, fontweight='bold')
+    ax.set_ylim(0, 2050)
+    plt.tight_layout()
+    plt.savefig("chart_deliveries.png", dpi=300)
+    plt.close()
+
+    # Chart 3: Global BEV Market Share 2024
+    companies = ['BYD', 'Tesla', 'VW Group', 'SAIC', 'Geely', 'Hyundai-Kia', 'BMW Group', 'Stellantis']
+    shares = [21.1, 17.6, 5.8, 5.0, 4.5, 3.8, 3.4, 2.9]
+    fig, ax = plt.subplots(figsize=(6.5, 2.5))
+    y_pos = range(len(companies))
+    ax.barh(y_pos, shares, color=['#1a1a1a' if x in ['BYD','Tesla'] else '#555555' for x in companies], edgecolor='#1a1a1a', height=0.6)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(companies, fontsize=8.5)
+    ax.invert_yaxis()  # Top-down tracking
+    ax.set_xlabel('Share of global BEV sales (%)', fontsize=9)
+    ax.set_title('Global BEV Market Share — 2024 (Top Players)', fontsize=10, fontweight='bold', pad=8)
+    ax.grid(axis='x', linestyle=':', alpha=0.6, color='#cccccc')
+    ax.set_axisbelow(True)
+    for i, v in enumerate(shares):
+        ax.text(v + 0.5, i, f"{v}%", va='center', fontsize=8, fontweight='bold')
+    ax.set_xlim(0, 25)
+    plt.tight_layout()
+    plt.savefig("chart_market_share.png", dpi=300)
+    plt.close()
+
+# =============================================================================
 # Table System Format Mechanics (File 1 Alternating Layout Rules)
 # =============================================================================
 def kv_table(pairs, label_width=4.5 * cm):
@@ -191,6 +263,9 @@ class NumberedCanvas:
 # Complete Structural Report Constructor
 # =============================================================================
 def build_pdf(output_path="tesla_model_y_report.pdf"):
+    # Trigger image pre-generation
+    generate_report_charts()
+
     company = "Tesla, Inc."
     product = "Model Y"
     title = "R&D Intelligence Report: Tesla Model Y"
@@ -305,7 +380,16 @@ def build_pdf(output_path="tesla_model_y_report.pdf"):
         Paragraph("2. Financial Overview", ST["section_h1"]),
         hr(),
         Paragraph("Tesla has grown revenue ~4x from $24.6B (2019) to $96.8B (2023), with a CAGR of approximately 41% over the four-year window. Vehicle deliveries grew nearly 5x over the same period, hitting 1.81M units in 2023. FY2024 delivery numbers came in at 1.79M, the first annual decline in Tesla's history, reflecting heavy price cuts and intensifying global competition.", ST["body"]),
-        sp(6),
+        sp(4),
+    ]
+
+    # Append Generated Financial Vector Graph Blocks
+    if os.path.exists("chart_revenue.png"):
+        story += [Image("chart_revenue.png", width=CONTENT_WIDTH, height=2.3*cm), sp(2)]
+    if os.path.exists("chart_deliveries.png"):
+        story += [Image("chart_deliveries.png", width=CONTENT_WIDTH, height=2.3*cm), sp(4)]
+
+    story += [
         Paragraph("Key FY2023 Financial Metrics", ST["section_h2"]),
     ]
     
@@ -346,18 +430,6 @@ def build_pdf(output_path="tesla_model_y_report.pdf"):
         ["Other International (incl. Europe)", "$30.0B", "31.1%"]
     ])
     if t2_geo: story.append(t2_geo)
-
-    story += [
-        sp(6),
-        Paragraph("FY2024 Quarterly Trajectory (Preliminary)", ST["section_h2"]),
-    ]
-    t2_q = data_table(["Quarter", "Revenue", "Deliveries", "Auto GM"], [
-        ["Q1 2024", "$21.30B", "386,810", "18.5%"],
-        ["Q2 2024", "$25.50B", "443,956", "18.4%"],
-        ["Q3 2024", "$25.18B", "462,890", "20.1%"],
-        ["Q4 2024 prelim", "$26.00B", "495,570", "TBD"]
-    ])
-    if t2_q: story.append(t2_q)
     story.append(PageBreak())
 
     # ==================== SECTION 3 ====================
@@ -417,6 +489,10 @@ def build_pdf(output_path="tesla_model_y_report.pdf"):
         Paragraph("Chinese developers led by BYD held over half of international BEV deliveries through 2024. Concurrently, legacy Western automakers continue closing technical execution gaps across scalable premium platform lines.", ST["body"]),
         sp(4),
     ]
+
+    # Append Generated Horizontal Bar Chart for Market Share Breakdown
+    if os.path.exists("chart_market_share.png"):
+        story += [Image("chart_market_share.png", width=CONTENT_WIDTH, height=2.5*cm), sp(4)]
     
     t5_share = data_table(["Company Rank", "Share %", "BEV Volume (Millions)"], [
         ["1. BYD", "21.1%", "1.76"],
@@ -517,6 +593,12 @@ def build_pdf(output_path="tesla_model_y_report.pdf"):
 
     # Render Document utilizing dynamic page-tracking canvas callbacks
     doc.build(story, onFirstPage=nb.footer, onLaterPages=nb.footer)
+    
+    # Cleanup chart images post-render to keep workspace clean
+    for path in ["chart_revenue.png", "chart_deliveries.png", "chart_market_share.png"]:
+        if os.path.exists(path):
+            os.remove(path)
+            
     print(f"[export_report] PDF successfully written to -> {output_path}")
 
 if __name__ == "__main__":
