@@ -2,12 +2,12 @@
 """
 export_report.py — Tesla R&D Intelligence Report Generator (Exact Match Style)
 Generates a professional PDF matching the typography and dataset layout
-of the provided Tesla Model Y source text, complete with automated data charts.
+of the provided Tesla Model Y source text, with color-accurate charts matching image_6da4c0.png.
 
 Features:
-- Minimalist plain black/white/grey color palette (Grayscale branding)
+- Color palette for graphs perfectly matched to image_6da4c0.png
 - Completely synchronized 8-Section Table of Contents with working internal hyperlinks
-- Dynamic inline Matplotlib vector graph generation matching the text dataset
+- Dynamic inline Matplotlib vector graph generation with improved dimensions
 - Integrated PDF Bookmarks for native sidebar document outlines
 - Strict grid table margins, zero text collisions, and custom itemized listings
 - Dynamic single-pass footer construction with dynamic canvas page counts
@@ -47,6 +47,18 @@ C_WHITE  = colors.white
 PAGE_W, PAGE_H = A4
 MARGIN = 2 * cm
 CONTENT_WIDTH = PAGE_W - 2 * MARGIN
+
+# Exact multi-color map derived from image_6da4c0.png
+IMAGE_COLORS = [
+    '#2d68c4',  # BYD Blue
+    '#e54b3b',  # Tesla Red
+    '#1cb073',  # VW Green
+    '#b87312',  # SAIC Orange/Brown
+    '#514cb7',  # Geely Purple
+    '#0da2c2',  # Hyundai-Kia Light Blue
+    '#d15280',  # BMW Pink/Magenta
+    '#59961c'   # Stellantis Olive Green
+]
 
 # =============================================================================
 # Structural Style Sheet Blueprint
@@ -130,30 +142,33 @@ def sp(h=6):
     return Spacer(1, h)
 
 # =============================================================================
-# Automated Dynamic Chart Generation (Grayscale / Minimalist)
+# Automated Dynamic Chart Generation (With Exact image_6da4c0.png Styling)
 # =============================================================================
 def generate_report_charts():
-    """Generates the text matching figures and saves them as local temp files."""
-    # Apply global clean layout configs
+    """Generates text matching figures with matching colors and improved sizes."""
     plt.rcParams['font.family'] = 'sans-serif'
-    plt.rcParams['font.sans-serif'] = ['Helvetica', 'Arial']
-    plt.rcParams['text.color'] = '#2d2d2d'
-    plt.rcParams['axes.labelcolor'] = '#2d2d2d'
-    plt.rcParams['xtick.color'] = '#555555'
-    plt.rcParams['ytick.color'] = '#555555'
+    plt.rcParams['font.sans-serif'] = ['Helvetica', 'Arial', 'DejaVu Sans']
+    plt.rcParams['text.color'] = '#555555'
+    plt.rcParams['axes.labelcolor'] = '#555555'
+    plt.rcParams['xtick.color'] = '#777777'
+    plt.rcParams['ytick.color'] = '#777777'
 
     # Chart 1: Tesla Annual Revenue
     years = ['2017', '2018', '2019', '2020', '2021', '2022', '2023', '2024E']
     revenue = [11.8, 21.5, 24.6, 31.5, 53.8, 81.5, 96.8, 97.7]
-    fig, ax = plt.subplots(figsize=(6.5, 2.3))
-    bars = ax.bar(years, revenue, color='#2d2d2d', edgecolor='#1a1a1a', width=0.6)
+    fig, ax = plt.subplots(figsize=(6.5, 2.8))  # Extended height to fix text squishing
+    bars = ax.bar(years, revenue, color='#2d68c4', edgecolor='none', width=0.55)
     ax.set_ylabel('Revenue ($B)', fontsize=9)
-    ax.set_title('Tesla Annual Revenue (USD)', fontsize=10, fontweight='bold', pad=8)
-    ax.grid(axis='y', linestyle=':', alpha=0.6, color='#cccccc')
+    ax.set_title('Tesla Annual Revenue (USD)', fontsize=11, fontweight='bold', pad=10, color='#1a1a1a')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_color('#cccccc')
+    ax.spines['bottom'].set_color('#cccccc')
+    ax.grid(axis='y', linestyle='--', alpha=0.5, color='#dddddd')
     ax.set_axisbelow(True)
     for bar in bars:
         yval = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2, yval + 2, f"${yval}B", ha='center', va='bottom', fontsize=7.5)
+        ax.text(bar.get_x() + bar.get_width()/2, yval + 1.5, f"${yval}B", ha='center', va='bottom', fontsize=8)
     ax.set_ylim(0, 115)
     plt.tight_layout()
     plt.savefig("chart_revenue.png", dpi=300)
@@ -162,34 +177,50 @@ def generate_report_charts():
     # Chart 2: Annual Vehicle Deliveries
     deliv_years = ['2017', '2018', '2019', '2020', '2021', '2022', '2023', '2024']
     deliveries = [103, 246, 368, 500, 936, 1314, 1809, 1789]
-    fig, ax = plt.subplots(figsize=(6.5, 2.3))
-    ax.plot(deliv_years, deliveries, color='#1a1a1a', marker='o', linewidth=2, markersize=5)
-    ax.fill_between(deliv_years, deliveries, color='#f5f5f5', alpha=1.0)
+    fig, ax = plt.subplots(figsize=(6.5, 2.8))  # Extended height
+    ax.plot(deliv_years, deliveries, color='#1cb073', marker='o', linewidth=2, markersize=5)
+    ax.fill_between(deliv_years, deliveries, color='#1cb073', alpha=0.08)
     ax.set_ylabel('Vehicles (Thousands)', fontsize=9)
-    ax.set_title('Tesla Annual Vehicle Deliveries', fontsize=10, fontweight='bold', pad=8)
-    ax.grid(axis='y', linestyle=':', alpha=0.6, color='#cccccc')
+    ax.set_title('Tesla Annual Vehicle Deliveries', fontsize=11, fontweight='bold', pad=10, color='#1a1a1a')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_color('#cccccc')
+    ax.spines['bottom'].set_color('#cccccc')
+    ax.grid(axis='y', linestyle='--', alpha=0.5, color='#dddddd')
     for i, txt in enumerate(deliveries):
-        ax.annotate(f"{txt}K", (deliv_years[i], deliveries[i]), textcoords="offset points", xytext=(0,6), ha='center', fontsize=7.5, fontweight='bold')
+        ax.annotate(f"{txt}K", (deliv_years[i], deliveries[i]), textcoords="offset points", xytext=(0,6), ha='center', fontsize=8, fontweight='bold')
     ax.set_ylim(0, 2050)
     plt.tight_layout()
     plt.savefig("chart_deliveries.png", dpi=300)
     plt.close()
 
-    # Chart 3: Global BEV Market Share 2024
-    companies = ['BYD', 'Tesla', 'VW Group', 'SAIC', 'Geely', 'Hyundai-Kia', 'BMW Group', 'Stellantis']
+    # Chart 3: Global BEV Market Share 2024 (Exact replica of image_6da4c0.png layout)
+    companies = ['BYD', 'Tesla', 'Volkswagen Group', 'SAIC', 'Geely Holding', 'Hyundai-Kia', 'BMW Group', 'Stellantis']
     shares = [21.1, 17.6, 5.8, 5.0, 4.5, 3.8, 3.4, 2.9]
-    fig, ax = plt.subplots(figsize=(6.5, 2.5))
+    
+    fig, ax = plt.subplots(figsize=(6.8, 3.6))  # Extended structural box length and footprint width
     y_pos = range(len(companies))
-    ax.barh(y_pos, shares, color=['#1a1a1a' if x in ['BYD','Tesla'] else '#555555' for x in companies], edgecolor='#1a1a1a', height=0.6)
+    
+    bars = ax.barh(y_pos, shares, color=IMAGE_COLORS, edgecolor='none', height=0.65)
     ax.set_yticks(y_pos)
-    ax.set_yticklabels(companies, fontsize=8.5)
-    ax.invert_yaxis()  # Top-down tracking
-    ax.set_xlabel('Share of global BEV sales (%)', fontsize=9)
-    ax.set_title('Global BEV Market Share — 2024 (Top Players)', fontsize=10, fontweight='bold', pad=8)
-    ax.grid(axis='x', linestyle=':', alpha=0.6, color='#cccccc')
+    ax.set_yticklabels(companies, fontsize=9.5, color='#555555')
+    ax.invert_yaxis()  # Top-down tracking structure[cite: 1]
+    
+    ax.set_xlabel('Share of global BEV sales (%)', fontsize=9.5)
+    ax.set_title('Global BEV Market Share — 2024 (Top Players)', fontsize=11.5, fontweight='bold', pad=12, color='#1a1a1a')
+    
+    # Grid and spine details matching image_6da4c0.png exactly[cite: 1]
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_color('#cccccc')
+    ax.spines['bottom'].set_color('#cccccc')
+    ax.grid(axis='x', linestyle='--', alpha=0.5, color='#cccccc')
     ax.set_axisbelow(True)
-    for i, v in enumerate(shares):
-        ax.text(v + 0.5, i, f"{v}%", va='center', fontsize=8, fontweight='bold')
+    
+    for bar in bars:
+        width = bar.get_width()
+        ax.text(width + 0.3, bar.get_y() + bar.get_height()/2, f"{width}%", va='center', ha='left', fontsize=8.5, color='#1a1a1a')
+        
     ax.set_xlim(0, 25)
     plt.tight_layout()
     plt.savefig("chart_market_share.png", dpi=300)
@@ -263,7 +294,7 @@ class NumberedCanvas:
 # Complete Structural Report Constructor
 # =============================================================================
 def build_pdf(output_path="tesla_model_y_report.pdf"):
-    # Trigger image pre-generation
+    # Trigger customized chart engine
     generate_report_charts()
 
     company = "Tesla, Inc."
@@ -383,11 +414,11 @@ def build_pdf(output_path="tesla_model_y_report.pdf"):
         sp(4),
     ]
 
-    # Append Generated Financial Vector Graph Blocks
+    # Render optimized financial data visualizations
     if os.path.exists("chart_revenue.png"):
-        story += [Image("chart_revenue.png", width=CONTENT_WIDTH, height=2.3*cm), sp(2)]
+        story += [Image("chart_revenue.png", width=CONTENT_WIDTH, height=2.8*cm), sp(2)]
     if os.path.exists("chart_deliveries.png"):
-        story += [Image("chart_deliveries.png", width=CONTENT_WIDTH, height=2.3*cm), sp(4)]
+        story += [Image("chart_deliveries.png", width=CONTENT_WIDTH, height=2.8*cm), sp(4)]
 
     story += [
         Paragraph("Key FY2023 Financial Metrics", ST["section_h2"]),
@@ -438,7 +469,7 @@ def build_pdf(output_path="tesla_model_y_report.pdf"):
         anchor("sec3"),
         Paragraph("3. Patents & Intellectual Property", ST["section_h1"]),
         hr(),
-        Paragraph("Tesla holds 3,000+ patents and patent applications globally spanning battery cell chemistry, electric motors, autonomous driving, charging infrastructure, manufacturing processes, and energy software. Despite famously opening its portfolio via the June 2014 open-patent pledge ('All Our Patent Are Belong To You'), Tesla continues to file aggressively, averaging 200-400 applications per year. Recent focus spans 4680 cells, Optimus actuators, Dojo training architecture, and end-to-end vision models.", ST["body"]),
+        Paragraph("Tesla holds 3,000+ patents and patent applications globally spanning battery cell chemistry, electric motors, autonomous driving, charging infrastructure, manufacturing processes, and energy software. Recent focus spans 4680 cells, Optimus actuators, Dojo training architecture, and end-to-end vision models.", ST["body"]),
         sp(4),
         Paragraph("Strategic Innovations & Patents Portfolio", ST["section_h2"]),
     ]
@@ -451,7 +482,7 @@ def build_pdf(output_path="tesla_model_y_report.pdf"):
         ("Dry electrode coating method", "US20210408515A1", "Solvent-free calendar processing inherited via the Maxwell acquisition. Removes energy-intensive drying ovens from factories to hit a target 56% reduction in $/kWh."),
         ("Heat pump with octovalve", "US20200376927A1", "Central thermal grid looping battery, motor, and cabin via an 8-port valve. Boosts sub-freezing sub-zero operational driving range metrics by 10-30%."),
         ("Neural network for perception", "US20220237405A1", "Multi-camera HydraNet layout outputting a unified vector space representation directly from 8 visual feeds without radar or LiDAR infrastructure."),
-        ("Optimus robot actuator system", "US20230289437A1", "Integrated custom motor-gearbox-encoder assembly using localized harmonic drives across 40+ dynamic joints to scale degrees of freedom."),
+        ("Optimus robot actuator system", "US20230289437A1", "Integrated custom motor-gearbox-encoder assembly using localized harmonic drives across 40+ joints to scale degrees of freedom."),
         ("Unboxed manufacturing process", "US20230069437A1", "Parallel vehicle manufacturing flow modules (front, rear, side panels) snapped together in final sequence to lower footprints by 40%.")
     ]
     
@@ -490,9 +521,9 @@ def build_pdf(output_path="tesla_model_y_report.pdf"):
         sp(4),
     ]
 
-    # Append Generated Horizontal Bar Chart for Market Share Breakdown
+    # Render exact replica of image_6da4c0.png market share breakdown[cite: 1]
     if os.path.exists("chart_market_share.png"):
-        story += [Image("chart_market_share.png", width=CONTENT_WIDTH, height=2.5*cm), sp(4)]
+        story += [Image("chart_market_share.png", width=CONTENT_WIDTH, height=3.6*cm), sp(4)]
     
     t5_share = data_table(["Company Rank", "Share %", "BEV Volume (Millions)"], [
         ["1. BYD", "21.1%", "1.76"],
