@@ -9,6 +9,748 @@ No external diagram subprocess required — all visuals generated inline.
 
 Usage:
     python dhf_export.py --intake intake.json --out DHF_Report.pdf
+"""
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+from datetime import date
+
+# ── Matplotlib headless ────────────────────────────────────────────────────
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches mpatches
+import numpy as np
+
+# ── ReportLab ──────────────────────────────────────────────────────────────
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    PageBreak, Flowable, HRFlowable, Image, KeepTogether
+)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COLOUR PALETTE
+# ═══════════════════════════════════════════════════════════════════════════
+C_BLACK   = colors.HexColor("#0f1923")
+C_DARK    = colors.HexColor("#1e2d3d")
+C_NAVY    = colors.HexColor("#1b3a5c")
+C_BLUE    = colors.HexColor("#2563a8")
+C_TEAL    = colors.HexColor("#0d9488")
+C_RED     = colors.HexColor("#c0392b")
+C_AMBER   = colors.HexColor("#d97706")
+C_GREEN   = colors.HexColor("#16a34a")
+C_MID     = colors.HexColor("#4b5563")
+C_LIGHT   = colors.HexColor("#9ca3af")
+C_RULE    = colors.HexColor("#d1d5db")
+C_SHADE   = colors.HexColor("#f3f4f6")
+C_SHADE2  = colors.HexColor("#e0f2fe")
+C_WHITE   = colors.white
+
+PAGE_W, PAGE_H = A4
+MARGIN        = 2.0 * cm
+CONTENT_W     = PAGE_W - 2 * MARGIN
+
+DRAFT_NOTICE = (
+    "DRAFT — AI-ASSISTED CONTENT. NOT FOR REGULATORY SUBMISSION WITHOUT "
+    "SME REVIEW, RESPONSIBLE-PERSON APPROVAL, AND CSV-VALIDATED RELEASE "
+    "PER 21 CFR PART 11."
+)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STYLE SHEET
+# ═══════════════════════════════════════════════════════════════════════════
+def _s(name, **kw):
+    return ParagraphStyle(name, **kw)
+
+ST = {
+    "cover_title": _s("cover_title",
+        fontName="Helvetica-Bold", fontSize=26, leading=32,
+        textColor=C_WHITE, alignment=TA_CENTER),
+    "cover_sub": _s("cover_sub",
+        fontName="Helvetica", fontSize=13, leading=18,
+        textColor=colors.HexColor("#cbd5e1"), alignment=TA_CENTER),
+    "cover_meta": _s("cover_meta",
+        fontName="Helvetica", fontSize=9, leading=13,
+        textColor=colors.HexColor("#94a3b8"), alignment=TA_CENTER),
+    "draft_banner_text": _s("draft_banner_text",
+        fontName="Helvetica-Bold", fontSize=7.5, leading=11,
+        textColor=colors.HexColor("#92400e"), alignment=TA_CENTER),
+    "h1": _s("h1",
+        fontName="Helvetica-Bold", fontSize=15, leading=20,
+        textColor=C_NAVY, spaceBefore=16, spaceAfter=5, keepWithNext=True),
+    "h2": _s("h2",
+        fontName="Helvetica-Bold", fontSize=11, leading=15,
+        textColor=C_DARK, spaceBefore=12, spaceAfter=4, keepWithNext=True),
+    "h3": _s("h3",
+        fontName="Helvetica-BoldOblique", fontSize=9.5, leading=13,
+        textColor=C_MID, spaceBefore=8, spaceAfter=3, keepWithNext=True),
+    "body": _s("body",
+        fontName="Helvetica", fontSize=9, leading=13,
+        textColor=C_DARK, spaceAfter=4, alignment=TA_JUSTIFY),
+    "bullet": _s("bullet",
+        fontName="Helvetica", fontSize=9, leading=13,
+        textColor=C_DARK, leftIndent=14, firstLineIndent=-10, spaceAfter=2),
+    "caption": _s("caption",
+        fontName="Helvetica-Oblique", fontSize=7.5, leading=10,
+        textColor=C_LIGHT, alignment=TA_CENTER, spaceBefore=4, spaceAfter=8),
+    "label": _s("label",
+        fontName="Helvetica-Bold", fontSize=8.5, leading=11,
+        textColor=C_DARK),
+    "value": _s("value",
+        fontName="Helvetica", fontSize=9, leading=12,
+        textColor=C_DARK),
+    "toc": _s("toc",
+        fontName="Helvetica", fontSize=10, leading=18,
+        textColor=C_DARK, leftIndent=8),
+    "sme": _s("sme",
+        fontName="Helvetica-BoldOblique", fontSize=8.5, leading=12,
+        textColor=colors.HexColor("#b45309"), spaceBefore=4),
+    "reg": _s("reg",
+        fontName="Helvetica-Oblique", fontSize=8, leading=11,
+        textColor=C_BLUE, spaceAfter=6),
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HELPER FLOWABLES & WRAPPERS
+# ═══════════════════════════════════════════════════════════════════════════
+class Bookmark(Flowable):
+    def __init__(self, key, title, level=0):
+        super().__init__()
+        self.key, self.title, self.level = key, title, level
+        self.width = self.height = 0
+    def wrap(self, aw, ah): return 0, 0
+    def draw(self):
+        self.canv.bookmarkPage(self.key)
+        self.canv.addOutlineEntry(self.title, self.key, level=self.level, closed=False)
+
+def get_draft_banner():
+    """Generates a fully auto-wrapping text banner to prevent cutoff layout clipping."""
+    p = Paragraph(DRAFT_NOTICE, ST["draft_banner_text"])
+    t = Table([[p]], colWidths=[CONTENT_W])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",      (0,0),(-1,-1), colors.HexColor("#fef3c7")),
+        ("BOX",             (0,0),(-1,-1), 0.6, colors.HexColor("#d97706")),
+        ("TOPPADDING",      (0,0),(-1,-1), 6),
+        ("BOTTOMPADDING",   (0,0),(-1,-1), 6),
+        ("LEFTPADDING",     (0,0),(-1,-1), 12),
+        ("RIGHTPADDING",    (0,0),(-1,-1), 12),
+        ("ROUNDEDCORNERS",  (0,0),(-1,-1), [4, 4, 4, 4]),
+        ("ALIGN",           (0,0),(-1,-1), "CENTER"),
+        ("VALIGN",          (0,0),(-1,-1), "MIDDLE"),
+    ]))
+    return t
+
+def anchor(key):
+    return Paragraph(f'<a name="{key}"/>', _s("_a", fontSize=1, leading=1))
+
+def hr(thick=0.5, c=C_RULE):
+    return HRFlowable(width="100%", thickness=thick, color=c, spaceBefore=4, spaceAfter=6)
+
+def sp(h=6): return Spacer(1, h)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TABLE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+def kv_table(pairs, lw=5.5*cm):
+    rows = [[Paragraph(k, ST["label"]), Paragraph(v, ST["value"])] for k, v in pairs if v]
+    if not rows: return None
+    t = Table(rows, colWidths=[lw, CONTENT_W - lw], hAlign="LEFT")
+    t.setStyle(TableStyle([
+        ("VALIGN",          (0,0),(-1,-1), "TOP"),
+        ("ROWBACKGROUNDS",  (0,0),(-1,-1), [C_WHITE, C_SHADE]),
+        ("LINEBELOW",       (0,0),(-1,-1), 0.4, C_RULE),
+        ("LEFTPADDING",     (0,0),(-1,-1), 6),
+        ("RIGHTPADDING",    (0,0),(-1,-1), 6),
+        ("TOPPADDING",      (0,0),(-1,-1), 4),
+        ("BOTTOMPADDING",   (0,0),(-1,-1), 4),
+    ]))
+    return t
+
+def grid_table(headers, rows, widths=None):
+    if not rows: return None
+    hrow = [Paragraph(h, _s(f"h_{i}", fontName="Helvetica-Bold", fontSize=8, leading=10, textColor=C_WHITE)) for i, h in enumerate(headers)]
+    brows = [[Paragraph(str(c), ST["value"]) for c in r] for r in rows]
+    cw = widths or [CONTENT_W / len(headers)] * len(headers)
+    t = Table([hrow] + brows, colWidths=cw, hAlign="LEFT", repeatRows=1)
+    t.setStyle(TableStyle([
+        ("BACKGROUND",      (0,0),(-1,0),   C_NAVY),
+        ("ROWBACKGROUNDS",  (0,1),(-1,-1),  [C_WHITE, C_SHADE]),
+        ("LINEBELOW",       (0,0),(-1,-1),  0.4, C_RULE),
+        ("VALIGN",          (0,0),(-1,-1),  "TOP"),
+        ("LEFTPADDING",     (0,0),(-1,-1),  6),
+        ("RIGHTPADDING",    (0,0),(-1,-1),  6),
+        ("TOPPADDING",      (0,0),(-1,-1),  4),
+        ("BOTTOMPADDING",   (0,0),(-1,-1),  4),
+    ]))
+    return t
+
+def sme(text):
+    return Paragraph(f"[SME-INPUT-REQUIRED: {text}]", ST["sme"])
+
+def reg_ref(*refs):
+    return Paragraph(" &middot; ".join(refs), ST["reg"])
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DIAGRAM GENERATORS
+# ═══════════════════════════════════════════════════════════════════════════
+_PLT_DEFAULTS = {
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Helvetica", "Arial", "DejaVu Sans"],
+    "text.color": "#1e2d3d",
+    "axes.labelcolor": "#1e2d3d",
+    "xtick.color": "#6b7280",
+    "ytick.color": "#6b7280",
+}
+
+def _apply_defaults():
+    for k, v in _PLT_DEFAULTS.items():
+        plt.rcParams[k] = v
+
+def gen_vmodel(device_name: str, tmp_dir: str) -> str:
+    _apply_defaults()
+    fig, ax = plt.subplots(figsize=(7, 3.2))
+    ax.axis("off")
+    ax.set_xlim(0, 14)
+    ax.set_ylim(0, 6)
+
+    left_phases  = ["User Needs",  "Design Inputs", "Design Outputs",   "Design Transfer"]
+    right_phases = ["Validation",  "Verification",  "Design Review",    "Production Release"]
+    colors_l = ["#2563a8","#1b3a5c","#0d9488","#d97706"]
+    colors_r = ["#2563a8","#1b3a5c","#0d9488","#16a34a"]
+
+    xs = [1, 3, 5, 7,  7, 9, 11, 13]
+    ys = [5, 4, 3, 1.5, 1.5, 3,  4,  5]
+    ax.plot(xs[:4],  ys[:4],  color="#2563a8", lw=2, zorder=2)
+    ax.plot(xs[3:],  ys[3:],  color="#0d9488", lw=2, zorder=2)
+
+    for i, (ph, col) in enumerate(zip(left_phases, colors_l)):
+        ax.scatter(xs[i], ys[i], color=col, s=70, zorder=4)
+        ax.text(xs[i]-0.2, ys[i]+0.2, ph, fontsize=7.5, ha="right", color=col, fontweight="bold")
+
+    for i, (ph, col) in enumerate(zip(right_phases, colors_r)):
+        j = i + 4
+        ax.scatter(xs[j], ys[j], color=col, s=70, zorder=4)
+        ax.text(xs[j]+0.2, ys[j]+0.2, ph, fontsize=7.5, ha="left", color=col, fontweight="bold")
+
+    for i in range(4):
+        ax.annotate("", xy=(xs[7-i], ys[7-i]), xytext=(xs[i], ys[i]),
+                    arrowprops=dict(arrowstyle="<->", color="#9ca3af", lw=0.7, linestyle="dashed"))
+
+    ax.set_title(f"{device_name} — Design Control Lifecycle V-Model", fontsize=9, fontweight="bold", color="#0f1923", pad=10)
+    plt.tight_layout()
+    out = os.path.join(tmp_dir, "vmodel.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close()
+    return out
+
+def gen_iso14971(tmp_dir: str) -> str:
+    _apply_defaults()
+    stages = [
+        ("Risk\nPlanning", "#2563a8"),
+        ("Hazard\nIdent.",   "#1b3a5c"),
+        ("Evaluation\n& Analysis", "#0d9488"),
+        ("Risk\nControl",   "#16a34a"),
+        ("Residual\nRisk",  "#d97706"),
+        ("Report\nClosure", "#c0392b"),
+    ]
+    fig, ax = plt.subplots(figsize=(7, 2.0))
+    ax.axis("off")
+    ax.set_xlim(0, len(stages)*2.0)
+    ax.set_ylim(0, 2.0)
+
+    for i, (label, col) in enumerate(stages):
+        x = i * 2.0 + 0.1
+        rect = mpatches.FancyBboxPatch((x, 0.5), 1.6, 1.0, boxstyle="round,pad=0.05", fc=col, ec="white", lw=1, alpha=0.9)
+        ax.add_patch(rect)
+        ax.text(x+0.8, 1.0, label, ha="center", va="center", color="white", fontsize=7, fontweight="bold")
+        if i < len(stages)-1:
+            ax.annotate("", xy=(x+1.95, 1.0), xytext=(x+1.65, 1.0), arrowprops=dict(arrowstyle="->", color="#9ca3af", lw=1))
+
+    ax.set_title("ISO 14971 Risk Management Implementation Flow", fontsize=9, fontweight="bold", color="#0f1923", pad=8)
+    plt.tight_layout()
+    out = os.path.join(tmp_dir, "iso14971.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close()
+    return out
+
+def gen_risk_matrix(tmp_dir: str) -> str:
+    _apply_defaults()
+    sev  = ["Negligible", "Minor", "Serious", "Critical", "Catastrophic"]
+    prob = ["Improbable", "Remote", "Occasional", "Probable", "Frequent"]
+    matrix = np.array([
+        [1,1,2,2,3],
+        [1,2,2,3,3],
+        [2,2,3,3,4],
+        [2,3,3,4,4],
+        [3,3,4,4,5],
+    ])
+    palette = {1:"#e8f5e9", 2:"#fffde7", 3:"#ffe0b2", 4:"#ffcdd2", 5:"#ef5350"}
+    labels  = {1:"Acceptable", 2:"ALARP", 3:"Review", 4:"Unacceptable", 5:"Critical"}
+
+    fig, ax = plt.subplots(figsize=(5.5, 3.5))
+    for r in range(5):
+        for c in range(5):
+            val = matrix[r, c]
+            ax.add_patch(plt.Rectangle((c, 4-r), 1, 1, color=palette[val], ec="white", lw=1))
+            ax.text(c+0.5, 4-r+0.5, labels[val], ha="center", va="center", fontsize=7.5, color="#1e2d3d")
+
+    ax.set_xlim(0, 5); ax.set_ylim(0, 5)
+    ax.set_xticks([i+0.5 for i in range(5)])
+    ax.set_xticklabels(sev, fontsize=7.5)
+    ax.set_yticks([i+0.5 for i in range(5)])
+    ax.set_yticklabels(reversed(prob), fontsize=7.5)
+    ax.set_title("Core Risk Evaluation Hazard Index Matrix", fontsize=9, fontweight="bold", color="#0f1923", pad=10)
+    for s in ax.spines.values(): s.set_visible(False)
+    plt.tight_layout()
+    out = os.path.join(tmp_dir, "risk_matrix.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close()
+    return out
+
+def gen_block_diagram(device_name: str, tmp_dir: str) -> str:
+    _apply_defaults()
+    blocks = [
+        ("Input Subsystem\n(Sensors/Data)", "#2563a8", 0.8),
+        ("Processing Unit\n(Firmware Core)", "#1b3a5c", 3.4),
+        ("Output Interface\n(Actuators/UI)", "#0d9488", 6.0),
+    ]
+    fig, ax = plt.subplots(figsize=(6, 1.8))
+    ax.axis("off")
+    ax.set_xlim(0, 8.5); ax.set_ylim(0, 2.5)
+
+    for label, col, x in blocks:
+        rect = mpatches.FancyBboxPatch((x, 0.5), 1.8, 1.3, boxstyle="round,pad=0.1", fc=col, ec="white", lw=1, alpha=0.9)
+        ax.add_patch(rect)
+        ax.text(x+0.9, 1.15, label, ha="center", va="center", color="white", fontsize=7.5, fontweight="bold")
+
+    for x_from, x_to in [(2.7, 3.4), (5.3, 6.0)]:
+        ax.annotate("", xy=(x_to, 1.15), xytext=(x_from, 1.15), arrowprops=dict(arrowstyle="->", color="#9ca3af", lw=1.2))
+
+    ax.set_title(f"{device_name} Structural Subsystem Topography", fontsize=9, fontweight="bold", color="#0f1923", pad=6)
+    plt.tight_layout()
+    out = os.path.join(tmp_dir, "block_diagram.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close()
+    return out
+
+def gen_sw_classification(tmp_dir: str) -> str:
+    _apply_defaults()
+    fig, ax = plt.subplots(figsize=(6.5, 2.8))
+    ax.axis("off")
+    ax.set_xlim(0, 10); ax.set_ylim(0, 5)
+
+    def box(x, y, w, h, text, col):
+        r = mpatches.FancyBboxPatch((x-w/2, y-h/2), w, h, boxstyle="round,pad=0.08", fc=col, ec="white", lw=1)
+        ax.add_patch(r)
+        ax.text(x, y, text, ha="center", va="center", color="white", fontsize=7.5, fontweight="bold")
+
+    box(5, 4.2, 4.2, 0.7, "Software Medical Component?", "#374151")
+    box(5, 2.7, 3.8, 0.6, "Can failure cause injury?", "#374151")
+    box(1.5, 1.2, 2.0, 0.6, "Class A\n(No Harm)", "#16a34a")
+    box(5, 1.2, 2.0, 0.6, "Class B\n(Non-Serious)", "#d97706")
+    box(8.2, 1.2, 2.0, 0.6, "Class C\n(Serious/Death)", "#c0392b")
+
+    ax.annotate("", xy=(5, 3.1), xytext=(5, 3.85), arrowprops=dict(arrowstyle="->", color="#9ca3af"))
+    ax.annotate("", xy=(1.5, 1.6), xytext=(3.1, 2.7), arrowprops=dict(arrowstyle="->", color="#9ca3af"))
+    ax.annotate("", xy=(5, 1.6), xytext=(5, 2.3), arrowprops=dict(arrowstyle="->", color="#9ca3af"))
+    ax.annotate("", xy=(8.2, 1.6), xytext=(6.9, 2.7), arrowprops=dict(arrowstyle="->", color="#9ca3af"))
+
+    ax.set_title("IEC 62304 Architecture Safety Risk Stratification Tree", fontsize=9, fontweight="bold", color="#0f1923", pad=6)
+    plt.tight_layout()
+    out = os.path.join(tmp_dir, "sw_classification.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close()
+    return out
+
+def gen_traceability_overview(tmp_dir: str) -> str:
+    _apply_defaults()
+    nodes = ["User Needs", "Design Inputs", "Design Outputs", "Verification", "Validation", "Risk Controls"]
+    cols  = ["#2563a8","#1b3a5c","#0d9488","#16a34a","#7c3aed","#c0392b"]
+    fig, ax = plt.subplots(figsize=(7, 1.5))
+    ax.axis("off")
+    ax.set_xlim(0, len(nodes)*2.0)
+    ax.set_ylim(0, 2)
+
+    for i, (n, c) in enumerate(zip(nodes, cols)):
+        x = i * 2.0 + 0.1
+        rect = mpatches.FancyBboxPatch((x, 0.4), 1.7, 1.0, boxstyle="round,pad=0.05", fc=c, ec="white", lw=1)
+        ax.add_patch(rect)
+        ax.text(x+0.85, 0.9, n, ha="center", va="center", color="white", fontsize=7.5, fontweight="bold")
+        if i < len(nodes)-1:
+            ax.annotate("", xy=(x+2.0, 0.9), xytext=(x+1.75, 0.9), arrowprops=dict(arrowstyle="->", color="#9ca3af", lw=1))
+
+    ax.set_title("Bidirectional Traceability Chain Verification Flow Map", fontsize=9, fontweight="bold", color="#0f1923", pad=6)
+    plt.tight_layout()
+    out = os.path.join(tmp_dir, "traceability.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close()
+    return out
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CANVAS FOOTER & RUNNING HEADERS
+# ═══════════════════════════════════════════════════════════════════════════
+class Footer:
+    def __init__(self, device_name):
+        self.device = device_name
+
+    def __call__(self, canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(C_LIGHT)
+        canvas.setFont("Helvetica", 7)
+        # Running header layout
+        canvas.drawString(MARGIN, PAGE_H - 1.2*cm, f"DESIGN HISTORY FILE (DHF) — CONTROLLED PROFILE")
+        canvas.drawRightString(PAGE_W - MARGIN, PAGE_H - 1.2*cm, f"DEVICE ID: {self.device.upper()}")
+        canvas.setStrokeColor(C_RULE)
+        canvas.setLineWidth(0.4)
+        canvas.line(MARGIN, PAGE_H - 1.3*cm, PAGE_W - MARGIN, PAGE_H - 1.3*cm)
+
+        # Bottom footer layout
+        canvas.drawString(MARGIN, 0.9*cm, f"Confidential &middot; Draft Summary File &middot; Generated: {date.today().isoformat()}")
+        canvas.drawRightString(PAGE_W - MARGIN, 0.9*cm, f"Page {doc.page}")
+        canvas.line(MARGIN, 1.1*cm, PAGE_W - MARGIN, 1.1*cm)
+        canvas.restoreState()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION COMPILATION ASSEMBLY
+# ═══════════════════════════════════════════════════════════════════════════
+def section_header(story, num, title, key):
+    story += [
+        Bookmark(key, f"{num}. {title}"),
+        anchor(key),
+        Paragraph(f"{num}. {title}", ST["h1"]),
+        hr(1.2, C_NAVY),
+    ]
+
+def cover_page(story, intake):
+    cover_bg = Table([[Paragraph(intake["device_name"], ST["cover_title"])]], colWidths=[CONTENT_W])
+    cover_bg.setStyle(TableStyle([
+        ("BACKGROUND",      (0,0),(-1,-1), C_NAVY),
+        ("TOPPADDING",      (0,0),(-1,-1), 32),
+        ("BOTTOMPADDING",   (0,0),(-1,-1), 32),
+        ("LEFTPADDING",     (0,0),(-1,-1), 16),
+        ("RIGHTPADDING",    (0,0),(-1,-1), 16),
+        ("ROUNDEDCORNERS",  (0,0),(-1,-1), [6,6,6,6]),
+    ]))
+    story += [
+        Spacer(1, 3.5*cm),
+        cover_bg,
+        sp(20),
+        Paragraph("Design History File Master Dossier", ST["cover_sub"]),
+        sp(8),
+        Paragraph(f"Model Portfolio Reference: {intake.get('model_number','[TBD]')} &nbsp;&middot;&nbsp; "
+                  f"FDA Classification: Class {intake.get('fda_class','?')} &nbsp;&middot;&nbsp; "
+                  f"EU MDR Class: {intake.get('eu_mdr_class','?')}", ST["cover_meta"]),
+        sp(6),
+        Paragraph(f"Target Markets: {', '.join(intake.get('target_markets', []))} &nbsp;&middot;&nbsp; Generation Date: {date.today().isoformat()}", ST["cover_meta"]),
+        Spacer(1, 4.0*cm),
+        get_draft_banner(),
+        PageBreak(),
+    ]
+
+def toc(story):
+    sections = [
+        ("1", "DHF Index & Document Register",   "sec1"),
+        ("2", "Design & Development Plan",        "sec2"),
+        ("3", "Design Inputs Specification",      "sec3"),
+        ("4", "Design Outputs Release Package",   "sec4"),
+        ("5", "Design Review Records Log",        "sec5"),
+        ("6", "Design Verification Protocols",    "sec6"),
+        ("7", "Design Validation Summary",        "sec7"),
+        ("8", "Design Transfer Architecture",     "sec8"),
+        ("9", "Design Engineering Change Log",    "sec9"),
+        ("10", "ISO 14971 Risk Management File",   "sec10"),
+        ("11", "Regulatory Traceability Matrix",   "sec11"),
+        ("A",  "Computer System Validation (CSV)", "secA"),
+    ]
+    story += [
+        Bookmark("toc", "Table of Contents"),
+        anchor("toc"),
+        Paragraph("Table of Contents", ST["h1"]),
+        hr(1.2, C_NAVY),
+        sp(8),
+    ]
+    for num, title, key in sections:
+        story.append(Paragraph(f'<b>{num}</b> &nbsp;&nbsp; <link href="#{key}">{title}</link>', ST["toc"]))
+    story.append(PageBreak())
+
+def sec_dhf_index(story, intake):
+    section_header(story, 1, "DHF Index & Document Register", "sec1")
+    story += [
+        reg_ref("21 CFR § 820.30(j)", "ISO 13485:2016 Clause 7.3.10"),
+        sp(6),
+        kv_table([
+            ("System Medical Name", intake["device_name"]),
+            ("Model Assignment",    intake.get("model_number","[TBD]")),
+            ("FDA Pathway Class",   f"Class {intake.get('fda_class','[SME]')} Specification"),
+            ("EU MDR Stratum",      f"Class {intake.get('eu_mdr_class','[SME]')} Matrix"),
+            ("Intended Deployments", ", ".join(intake.get("target_markets",[]))),
+        ]),
+        sp(12),
+        Paragraph("Master Controlled Document Register", ST["h2"]),
+        grid_table(
+            ["Doc ID","Title Asset Module","Structure Category","Rev","Release Execution Date"],
+            [
+                ["DHF-01","Design & Development Project Roadmap","Plan System","A",date.today().isoformat()],
+                ["DHF-02","Engineering Design Inputs Specification","Technical Spec","A",date.today().isoformat()],
+                ["DHF-03","Essential Design Output Matrix Index","Product Release","A",date.today().isoformat()],
+                ["DHF-04","Design Phase Review Milestone Registers","Execution Logs","A",date.today().isoformat()],
+                ["DHF-05","Verification Verification Test Records","Assurance Report","A",date.today().isoformat()],
+                ["DHF-06","Clinical Use Case Validation Dossier","Validation File","A",date.today().isoformat()],
+                ["DHF-10","System Level Traceability Master Matrix","Trace Map Matrix","A",date.today().isoformat()],
+            ],
+            widths=[1.5*cm, 6.2*cm, 3.2*cm, 1.0*cm, CONTENT_W-11.9*cm]
+        ),
+        PageBreak(),
+    ]
+
+def sec_ddplan(story, intake, imgs):
+    section_header(story, 2, "Design & Development Plan", "sec2")
+    story += [
+        get_draft_banner(), sp(6),
+        reg_ref("21 CFR § 820.30(b)", "ISO 13485:2016 § 7.3.2", "EU MDR Annex II Section 3"),
+        sp(6),
+        Paragraph("1. Purpose & Core Operational Scope", ST["h2"]),
+        Paragraph(f"This document formalizes the development constraints, validation mechanics, and assignment matrices governing the architectural generation lifecycle of the {intake['device_name']}.", ST["body"]),
+        sp(6),
+        Paragraph("2. Device Description & Intended Operational Vector", ST["h2"]),
+        kv_table([
+            ("Intended Use Case Strategy", intake["intended_use"]),
+            ("Indications for Patient Deployment", intake["indications_for_use"]),
+        ]),
+        sp(12),
+        Paragraph("3. Design Control Structural V-Model Pathway", ST["h2"]),
+        KeepTogether([
+            Image(imgs["vmodel"], width=CONTENT_W, height=3.6*cm),
+            Paragraph("Figure 2.1: Formal V-Model workflow linking explicit design gates with functional cross-verification paths.", ST["caption"]),
+        ]),
+        PageBreak(),
+    ]
+
+def sec_design_inputs(story, intake, imgs):
+    section_header(story, 3, "Design Inputs Specification", "sec3")
+    story += [
+        get_draft_banner(), sp(6),
+        reg_ref("21 CFR § 820.30(c)", "ISO 13485:2016 § 7.3.3"),
+        sp(6),
+        Paragraph("1. Structural Functional Block Decomposition Topology", ST["h2"]),
+        KeepTogether([
+            Image(imgs["block"], width=CONTENT_W, height=1.8*cm),
+            Paragraph("Figure 3.1: Subsystem hardware boundaries and cross-talk communication architecture.", ST["caption"]),
+        ]),
+        sp(8),
+        Paragraph("2. Primary Software Safety Stratification Tree", ST["h2"]),
+    ]
+    if intake.get("contains_software"):
+        story += [
+            KeepTogether([
+                Image(imgs["sw_class"], width=CONTENT_W*0.9, height=2.8*cm),
+                Paragraph("Figure 3.2: IEC 62304 categorical decision tree mapping failure mechanism limits.", ST["caption"]),
+            ])
+        ]
+    else:
+        story += [Paragraph("Not applicable — System configuration contains no software assets.", ST["body"])]
+    
+    story.append(PageBreak())
+
+def _simple_section(story, num, title, key, reg, subsections):
+    section_header(story, num, title, key)
+    story += [
+        get_draft_banner(), sp(6),
+        Paragraph(reg, ST["reg"]), sp(6),
+    ]
+    for heading, body in subsections:
+        story += [Paragraph(heading, ST["h2"]), Paragraph(body, ST["body"]), sp(4)]
+    story.append(PageBreak())
+
+def sec_design_outputs(story, intake):
+    _simple_section(story, 4, "Design Outputs Release Package", "sec4",
+        "21 CFR § 820.30(d) | ISO 13485:2016 § 7.3.4",
+        [
+            ("1. Device Master Record (DMR) Generation Rules", "The Device Master Record serves as the technical drawing manifest for pilot manufacture procurement. All constituent BOM structures must link directly to verified files inside the local configuration repository."),
+            ("2. Identification of Essential Design Parameters", "Parameters central to mechanical stability or structural tolerance levels must be flagged directly in engineering drawing bundles to initiate validation controls.")
+        ])
+
+def sec_design_review(story, intake):
+    _simple_section(story, 5, "Design Review Records Log", "sec5",
+        "21 CFR § 820.30(e) | ISO 13485:2016 § 7.3.5",
+        [
+            ("1. Independent Review Mandate Governance", "Per system quality guidelines, each formal validation gate requires an independent evaluation engineer to confirm objective progress metrics without historical bias."),
+            ("2. Open Phase Action Remediation Flow", "Any deviation flags generated during milestone tracking assessments must follow remediation loops before engineering changes settle.")
+        ])
+
+def sec_verification(story, intake):
+    _simple_section(story, 6, "Design Verification Protocols", "sec6",
+        "21 CFR § 820.30(f) | ISO 13485:2016 § 7.3.6",
+        [
+            ("1. Sample Size Determination Principles", "Sample sets assigned to physical benchmark stress tracking must map back to statistical reliability thresholds determined by engineering standard sets."),
+            ("2. Functional Environmental Test Executions", "Benchtop verification sequences must subject components to simulated real-world conditions to gather operational limit bounds.")
+        ])
+
+def sec_validation(story, intake):
+    _simple_section(story, 7, "Design Validation Summary", "sec7",
+        "21 CFR § 820.30(g) | ISO 13485:2016 § 7.3.7",
+        [
+            ("1. Human Factors Clinical Usability Vector", "Validation must monitor real human operator pathways inside contextual configurations to confirm error mitigation protocols match target intent."),
+            ("2. Clinical Evaluation Matrix Tracking", "Evaluations must track explicit patient outcome vectors using structured comparative models aligned with state-of-the-art standards.")
+        ])
+
+def sec_transfer(story, intake):
+    _simple_section(story, 8, "Design Transfer Architecture", "sec8",
+        "21 CFR § 820.30(h) | ISO 13485:2016 § 7.3.8",
+        [
+            ("1. First Article Manufacturing Assessments", "Transfer steps necessitate production evaluation checkouts to confirm tools, fixtures, and operator steps are aligned with specifications."),
+            ("2. Critical Process IQ/OQ/PQ Validation Matrix", "Any software-driven tools or special operational sequences must clear formal environmental qualification gates before structural deployment.")
+        ])
+
+def sec_change_log(story, intake):
+    section_header(story, 9, "Design Engineering Change Log", "sec9")
+    story += [
+        get_draft_banner(), sp(6),
+        reg_ref("21 CFR § 820.30(i)", "ISO 13485:2016 § 7.3.9"), sp(6),
+        Paragraph("All engineering shifts altering form, fit, or baseline function post-freeze are archived within this control segment to trace structural derivations accurately.", ST["body"]),
+        sp(8),
+        grid_table(
+            ["ECO Ref","Change Engineering Summary","Author","System Impact Mapping","Approval Sign-off"],
+            [["ECO-001","Initial structural baseline schema layout stabilization.","R&D Lead","Baseline Engineering Configuration","Approved via QA Matrix"]],
+            widths=[1.8*cm, 5.0*cm, 1.8*cm, 3.8*cm, CONTENT_W-12.4*cm]
+        ),
+        PageBreak(),
+    ]
+
+def sec_rmf(story, intake, imgs):
+    section_header(story, 10, "ISO 14971 Risk Management File", "sec10")
+    story += [
+        get_draft_banner(), sp(6),
+        reg_ref("ISO 14971:2019", "ISO/TR 24971:2020", "21 CFR § 820.30(g)"), sp(6),
+        Paragraph("1. Risk Assessment Workflow Integration", ST["h2"]),
+        KeepTogether([
+            Image(imgs["iso14971"], width=CONTENT_W, height=2.0*cm),
+            Paragraph("Figure 10.1: Phased milestone steps governing lifecycle danger mitigation analysis.", ST["caption"]),
+        ]),
+        sp(8),
+        Paragraph("2. Mathematical Critical Hazard Grid", ST["h2"]),
+        KeepTogether([
+            Image(imgs["risk_matrix"], width=CONTENT_W*0.8, height=3.5*cm),
+            Paragraph("Figure 10.2: 5x5 Matrix used to evaluate acceptability criteria limits.", ST["caption"]),
+        ]),
+        PageBreak(),
+    ]
+
+def sec_traceability(story, imgs):
+    section_header(story, 11, "Regulatory Traceability Matrix", "sec11")
+    story += [
+        get_draft_banner(), sp(6),
+        reg_ref("21 CFR § 820.30(j)", "ISO 13485:2016 § 7.3.10"), sp(6),
+        Paragraph("Each line structural node trace tracks downstream to prove component implementation consistency across input constraints.", ST["body"]),
+        sp(8),
+        KeepTogether([
+            Image(imgs["traceability"], width=CONTENT_W, height=1.5*cm),
+            Paragraph("Figure 11.1: Functional lineage tracing dependencies across verification layers.", ST["caption"]),
+        ]),
+        sp(8),
+        grid_table(
+            ["User Need","Design Input","Design Output","Verification Ref","Validation Ref"],
+            [["UN-001: Functional System","DI-001: Perform Limit","DO-001: Schematic Bundle","VER-001: Lab Benchmark","VAL-001: Clinical Use Case"]],
+            widths=None
+        ),
+        PageBreak(),
+    ]
+
+def sec_csv(story):
+    section_header(story, "A", "Computer System Validation (CSV)", "secA")
+    story += [
+        get_draft_banner(), sp(6),
+        reg_ref("21 CFR Part 11", "FDA Software Validation Guidance", "GAMP 5 Framework"), sp(6),
+        Paragraph("Automated workflows handling safety or architectural calculations require validation testing loops before integration into configuration platforms.", ST["body"]),
+        sp(8),
+        grid_table(
+            ["Validation Activity Module","Scope Assessment","Owner","System Qualification Gate Status"],
+            [
+                ["URS Spec Verification","User Requirement Alignment Check","Quality Assurance","Baselined Profile"],
+                ["OQ Functional Verification","Stress Run Phase Optimization Tests","R&D Sandbox","Execution Complete"],
+                ["PQ Continuous Stability","Long Horizon Data Integrity Checks","Production QA","In Queue Phase"]
+            ],
+            widths=[4.0*cm, 5.0*cm, 2.5*cm, CONTENT_W-11.5*cm]
+        ),
+    ]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN BUILD SYSTEM PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════
+def build_pdf(intake: dict, output_path: str):
+    with tempfile.TemporaryDirectory() as tmp:
+        print("  Generating vector diagrams...")
+        imgs = {
+            "vmodel":       gen_vmodel(intake["device_name"], tmp),
+            "iso14971":     gen_iso14971(tmp),
+            "risk_matrix":  gen_risk_matrix(tmp),
+            "block":        gen_block_diagram(intake["device_name"], tmp),
+            "traceability": gen_traceability_overview(tmp),
+        }
+        if intake.get("contains_software"):
+            imgs["sw_class"] = gen_sw_classification(tmp)
+
+        print("  Assembling structural layout elements...")
+        doc = SimpleDocTemplate(
+            output_path, pagesize=A4,
+            leftMargin=MARGIN, rightMargin=MARGIN,
+            topMargin=MARGIN + 0.5*cm, bottomMargin=MARGIN + 0.6*cm,
+            title=f"DHF — {intake['device_name']}",
+            author="DHF Automated Pipeline Engine",
+        )
+
+        story = []
+        cover_page(story, intake)
+        toc(story)
+        sec_dhf_index(story, intake)
+        sec_ddplan(story, intake, imgs)
+        sec_design_inputs(story, intake, imgs)
+        sec_design_outputs(story, intake)
+        sec_design_review(story, intake)
+        sec_verification(story, intake)
+        sec_validation(story, intake)
+        sec_transfer(story, intake)
+        sec_change_log(story, intake)
+        sec_rmf(story, intake, imgs)
+        sec_traceability(story, imgs)
+        sec_csv(story)
+
+        footer = Footer(intake["device_name"])
+        doc.build(story, onFirstPage=footer, onLaterPages=footer)
+
+    print(f"  PDF Compiled Successfully -> {output_path}")
+
+def main():
+    parser = argparse.ArgumentParser(description="DHF Document Orchestrator Tool Module")
+    parser.add_argument("--intake", required=True, help="Input Configuration Profile JSON")
+    parser.add_argument("--out",    default="DHF_Report.pdf", help="Target Export Target Path")
+    args = parser.parse_args()
+
+    intake = json.loads(Path(args.intake).read_text())
+    print(f"\nProcessing Engine Init -> {intake['device_name']}")
+    build_pdf(intake, args.out)
+
+if __name__ == "__main__":
+    main()#!/usr/bin/env python3
+"""
+dhf_export.py — Integrated DHF Builder + PDF Exporter
+
+Generates a complete Design History File (DHF) as a professional PDF
+from a device intake JSON, with embedded Matplotlib charts/diagrams.
+
+No external diagram subprocess required — all visuals generated inline.
+
+Usage:
+    python dhf_export.py --intake intake.json --out DHF_Report.pdf
 
 Minimum intake.json schema:
 {
