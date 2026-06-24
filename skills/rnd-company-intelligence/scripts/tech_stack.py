@@ -1,468 +1,1099 @@
 #!/usr/bin/env python3
 """
-tech_stack.py — Detected technology-stack lookup for the rnd-tech-stack skill.
+dhf_export.py — Integrated DHF Builder + PDF Exporter
 
-Commands:
-    detect          --domain example.com
-                    Looks up the domain's current stack via the BuiltWith API.
-                    Requires BUILTWITH_API_KEY. Exits with a clear error (not a
-                    crash) if the key is missing so the calling agent can switch
-                    to the fallback commands below.
+Generates a complete Design History File (DHF) as a professional PDF
+from a device intake JSON, with embedded Matplotlib charts/diagrams.
 
-    web-fallback    --query "..."  [--limit N] [--engine ddg|bing|brave|mojeek|google-cse|all]
-                    Fans out across whichever free search engines are configured
-                    and returns merged, deduped results for manual/LLM synthesis
-                    (e.g. engineering-blog posts, "how it's built" writeups, job
-                    postings that mention the stack). Always includes DuckDuckGo
-                    (no key needed). Other engines are silently skipped if their
-                    API key isn't set.
+No external diagram subprocess required — all visuals generated inline.
 
-    github-fallback --query "..." [--type repositories|code|users] [--limit N]
-                    Searches GitHub's public search API for repos/code/users
-                    related to the query. Works without a token at a low rate
-                    limit; set GITHUB_TOKEN to raise it.
+Usage:
+    python dhf_export.py --intake intake.json --out DHF_Report.pdf
 
-Output: every command prints a single JSON object to stdout on success, and a
-JSON object with an "error" key (plus enough detail to act on) on failure.
-Network/API failures never raise uncaught — they're reported as structured
-errors so the calling agent can decide whether to retry, fall back, or skip.
+Minimum intake.json schema:
+{
+  "device_name": "string",
+  "model_number": "string",
+  "intended_use": "string",
+  "indications_for_use": "string",
+  "fda_class": "I | II | III",
+  "eu_mdr_class": "I | IIa | IIb | III",
+  "patient_contacting": true,
+  "sterile": false,
+  "contains_software": false,
+  "electromedical": false,
+  "reusable": false,
+  "implantable": true,
+  "target_markets": ["US", "EU"]
+}
 """
 
 import argparse
 import json
 import os
 import sys
-import time
-import urllib.parse
+import tempfile
+from pathlib import Path
+from datetime import date
 
-import requests
+# ── Matplotlib headless ────────────────────────────────────────────────────
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
 
-DEFAULT_TIMEOUT = 15
-USER_AGENT = "rnd-tech-stack-skill/1.6.0 (+https://github.com/openclaw-user)"
+# ── ReportLab ──────────────────────────────────────────────────────────────
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    PageBreak, Flowable, HRFlowable, Image, KeepTogether
+)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# COLOUR PALETTE
+# ═══════════════════════════════════════════════════════════════════════════
+C_BLACK   = colors.HexColor("#0f1923")
+C_DARK    = colors.HexColor("#1e2d3d")
+C_NAVY    = colors.HexColor("#1b3a5c")
+C_BLUE    = colors.HexColor("#2563a8")
+C_TEAL    = colors.HexColor("#0d9488")
+C_RED     = colors.HexColor("#c0392b")
+C_AMBER   = colors.HexColor("#d97706")
+C_GREEN   = colors.HexColor("#16a34a")
+C_MID     = colors.HexColor("#4b5563")
+C_LIGHT   = colors.HexColor("#9ca3af")
+C_RULE    = colors.HexColor("#d1d5db")
+C_SHADE   = colors.HexColor("#f3f4f6")
+C_SHADE2  = colors.HexColor("#e0f2fe")
+C_WHITE   = colors.white
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
+PAGE_W, PAGE_H = A4
+MARGIN        = 2.0 * cm
+CONTENT_W     = PAGE_W - 2 * MARGIN
 
-def emit(payload: dict, exit_code: int = 0) -> None:
-    """Print a single JSON object to stdout and exit."""
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
-    sys.exit(exit_code)
+DRAFT_NOTICE = (
+    "DRAFT — AI-ASSISTED CONTENT. NOT FOR REGULATORY SUBMISSION WITHOUT "
+    "SME REVIEW, RESPONSIBLE-PERSON APPROVAL, AND CSV-VALIDATED RELEASE "
+    "PER 21 CFR PART 11."
+)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# STYLE SHEET
+# ═══════════════════════════════════════════════════════════════════════════
+def _s(name, **kw):
+    return ParagraphStyle(name, **kw)
 
-def emit_error(message: str, *, status: int = None, hint: str = None, exit_code: int = 1) -> None:
-    payload = {"error": message}
-    if status is not None:
-        payload["status"] = status
-    if hint is not None:
-        payload["hint"] = hint
-    emit(payload, exit_code=exit_code)
-
-
-def normalize_domain(raw: str) -> str:
-    """Strip scheme/path/www so BuiltWith and friends get a bare domain."""
-    raw = raw.strip()
-    if "://" not in raw:
-        raw = "https://" + raw
-    parsed = urllib.parse.urlparse(raw)
-    host = parsed.netloc or parsed.path
-    host = host.split("/")[0]
-    if host.startswith("www."):
-        host = host[4:]
-    return host.lower()
-
-
-def http_get(url: str, *, params: dict = None, headers: dict = None, timeout: int = DEFAULT_TIMEOUT):
-    """Thin wrapper so every engine reports failures the same structured way."""
-    req_headers = {"User-Agent": USER_AGENT}
-    if headers:
-        req_headers.update(headers)
-    try:
-        resp = requests.get(url, params=params, headers=req_headers, timeout=timeout)
-        return resp, None
-    except requests.exceptions.Timeout:
-        return None, {"error": "request timed out", "url": url}
-    except requests.exceptions.RequestException as exc:
-        return None, {"error": str(exc), "url": url}
-
-
-# --------------------------------------------------------------------------- #
-# detect — BuiltWith
-# --------------------------------------------------------------------------- #
-
-def cmd_detect(args: argparse.Namespace) -> None:
-    api_key = os.environ.get("BUILTWITH_API_KEY")
-    if not api_key:
-        emit_error(
-            "BUILTWITH_API_KEY is not set.",
-            hint="Run web-fallback and github-fallback instead, and label results "
-                 "as inferred from public sources rather than BuiltWith.",
-            exit_code=2,
-        )
-
-    domain = normalize_domain(args.domain)
-    resp, transport_err = http_get(
-        "https://api.builtwith.com/v21/api.json",
-        params={"KEY": api_key, "LOOKUP": domain},
-    )
-
-    if transport_err:
-        emit_error(f"Network error calling BuiltWith: {transport_err['error']}", exit_code=3)
-
-    if resp.status_code in (401, 403):
-        emit_error(
-            "BuiltWith rejected the API key.",
-            status=resp.status_code,
-            hint="Tell the user BUILTWITH_API_KEY needs to be regenerated, then "
-                 "fall back to web-fallback / github-fallback.",
-            exit_code=4,
-        )
-    if resp.status_code == 404:
-        emit_error(
-            f"No BuiltWith data found for domain '{domain}'.",
-            status=404,
-            hint="Re-confirm the domain, or fall back to web-fallback / github-fallback.",
-            exit_code=5,
-        )
-    if resp.status_code == 429:
-        emit_error(
-            "BuiltWith rate-limited this request.",
-            status=429,
-            hint="Wait for the reset window if one was reported, otherwise fall back.",
-            exit_code=6,
-        )
-    if resp.status_code >= 500:
-        emit_error(
-            "BuiltWith is having an upstream outage.",
-            status=resp.status_code,
-            hint="Fall back to web-fallback / github-fallback rather than blocking.",
-            exit_code=7,
-        )
-    if resp.status_code != 200:
-        emit_error(
-            f"Unexpected BuiltWith response ({resp.status_code}).",
-            status=resp.status_code,
-            exit_code=8,
-        )
-
-    try:
-        data = resp.json()
-    except ValueError:
-        emit_error("BuiltWith returned a non-JSON response.", exit_code=9)
-
-    results = data.get("Results", [])
-    if not results:
-        emit_error(
-            f"BuiltWith returned no results for '{domain}'.",
-            hint="Domain may be too new or too small for BuiltWith's index. Fall back.",
-            exit_code=5,
-        )
-
-    paths = results[0].get("Result", {}).get("Paths", [])
-    stack = {}
-    for path in paths:
-        for tech in path.get("Technologies", []):
-            category = tech.get("Tag") or tech.get("Categories", [{}])[0].get("Name", "Other")
-            stack.setdefault(category, [])
-            entry = {
-                "name": tech.get("Name"),
-                "description": tech.get("Description"),
-                "first_detected": tech.get("FirstDetected"),
-                "last_detected": tech.get("LastDetected"),
-            }
-            if entry not in stack[category]:
-                stack[category].append(entry)
-
-    emit({
-        "domain": domain,
-        "source": "BuiltWith",
-        "retrieved_at": int(time.time()),
-        "stack_by_category": stack,
-    })
-
-
-# --------------------------------------------------------------------------- #
-# web-fallback — free multi-engine search
-# --------------------------------------------------------------------------- #
-
-def search_ddg(query: str, limit: int) -> tuple:
-    """DuckDuckGo via the ddgs library — always available, no key required."""
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        return [], {"engine": "ddg", "error": "ddgs library not installed"}
-
-    try:
-        with DDGS() as ddgs:
-            raw = list(ddgs.text(query, max_results=limit))
-        results = [
-            {"title": r.get("title"), "url": r.get("href"), "snippet": r.get("body"), "engine": "ddg"}
-            for r in raw
-        ]
-        return results, None
-    except Exception as exc:
-        return [], {"engine": "ddg", "error": str(exc)}
-
-
-def search_bing(query: str, limit: int) -> tuple:
-    key = os.environ.get("BING_SEARCH_API_KEY")
-    if not key:
-        return [], None  # silently skipped, not an error
-    resp, transport_err = http_get(
-        "https://api.bing.microsoft.com/v7.0/search",
-        params={"q": query, "count": limit},
-        headers={"Ocp-Apim-Subscription-Key": key},
-    )
-    if transport_err:
-        return [], {"engine": "bing", "error": transport_err["error"]}
-    if resp.status_code != 200:
-        return [], {"engine": "bing", "error": f"HTTP {resp.status_code}"}
-    data = resp.json()
-    items = data.get("webPages", {}).get("value", [])
-    results = [
-        {"title": i.get("name"), "url": i.get("url"), "snippet": i.get("snippet"), "engine": "bing"}
-        for i in items
-    ]
-    return results, None
-
-
-def search_brave(query: str, limit: int) -> tuple:
-    key = os.environ.get("BRAVE_SEARCH_API_KEY")
-    if not key:
-        return [], None
-    resp, transport_err = http_get(
-        "https://api.search.brave.com/res/v1/web/search",
-        params={"q": query, "count": limit},
-        headers={"X-Subscription-Token": key, "Accept": "application/json"},
-    )
-    if transport_err:
-        return [], {"engine": "brave", "error": transport_err["error"]}
-    if resp.status_code != 200:
-        return [], {"engine": "brave", "error": f"HTTP {resp.status_code}"}
-    data = resp.json()
-    items = data.get("web", {}).get("results", [])
-    results = [
-        {"title": i.get("title"), "url": i.get("url"), "snippet": i.get("description"), "engine": "brave"}
-        for i in items
-    ]
-    return results, None
-
-
-def search_mojeek(query: str, limit: int) -> tuple:
-    key = os.environ.get("MOJEEK_API_KEY")
-    if not key:
-        return [], None
-    resp, transport_err = http_get(
-        "https://www.mojeek.com/search",
-        params={"q": query, "fmt": "json", "t": limit, "api_key": key},
-    )
-    if transport_err:
-        return [], {"engine": "mojeek", "error": transport_err["error"]}
-    if resp.status_code != 200:
-        return [], {"engine": "mojeek", "error": f"HTTP {resp.status_code}"}
-    data = resp.json()
-    items = data.get("response", {}).get("results", [])
-    results = [
-        {"title": i.get("title"), "url": i.get("url"), "snippet": i.get("desc"), "engine": "mojeek"}
-        for i in items
-    ]
-    return results, None
-
-
-def search_google_cse(query: str, limit: int) -> tuple:
-    key = os.environ.get("GOOGLE_CSE_API_KEY")
-    cse_id = os.environ.get("GOOGLE_CSE_ID")
-    if not key or not cse_id:
-        return [], None
-    resp, transport_err = http_get(
-        "https://www.googleapis.com/customsearch/v1",
-        params={"key": key, "cx": cse_id, "q": query, "num": min(limit, 10)},
-    )
-    if transport_err:
-        return [], {"engine": "google-cse", "error": transport_err["error"]}
-    if resp.status_code != 200:
-        return [], {"engine": "google-cse", "error": f"HTTP {resp.status_code}"}
-    data = resp.json()
-    items = data.get("items", [])
-    results = [
-        {"title": i.get("title"), "url": i.get("link"), "snippet": i.get("snippet"), "engine": "google-cse"}
-        for i in items
-    ]
-    return results, None
-
-
-ENGINES = {
-    "ddg": search_ddg,
-    "bing": search_bing,
-    "brave": search_brave,
-    "mojeek": search_mojeek,
-    "google-cse": search_google_cse,
+ST = {
+    "cover_title": _s("cover_title",
+        fontName="Helvetica-Bold", fontSize=28, leading=36,
+        textColor=C_WHITE, alignment=TA_CENTER),
+    "cover_sub": _s("cover_sub",
+        fontName="Helvetica", fontSize=13, leading=18,
+        textColor=colors.HexColor("#cbd5e1"), alignment=TA_CENTER),
+    "cover_meta": _s("cover_meta",
+        fontName="Helvetica", fontSize=9, leading=13,
+        textColor=colors.HexColor("#94a3b8"), alignment=TA_CENTER),
+    "draft_banner": _s("draft_banner",
+        fontName="Helvetica-Bold", fontSize=8, leading=11,
+        textColor=colors.HexColor("#92400e"), alignment=TA_CENTER),
+    "h1": _s("h1",
+        fontName="Helvetica-Bold", fontSize=15, leading=20,
+        textColor=C_NAVY, spaceBefore=16, spaceAfter=5),
+    "h2": _s("h2",
+        fontName="Helvetica-Bold", fontSize=11, leading=15,
+        textColor=C_DARK, spaceBefore=10, spaceAfter=3),
+    "h3": _s("h3",
+        fontName="Helvetica-BoldOblique", fontSize=9.5, leading=13,
+        textColor=C_MID, spaceBefore=7, spaceAfter=2),
+    "body": _s("body",
+        fontName="Helvetica", fontSize=9, leading=13,
+        textColor=C_DARK, spaceAfter=3),
+    "bullet": _s("bullet",
+        fontName="Helvetica", fontSize=9, leading=13,
+        textColor=C_DARK, leftIndent=14, firstLineIndent=-10, spaceAfter=2),
+    "caption": _s("caption",
+        fontName="Helvetica-Oblique", fontSize=7.5, leading=10,
+        textColor=C_LIGHT, alignment=TA_CENTER),
+    "label": _s("label",
+        fontName="Helvetica-Bold", fontSize=8, leading=11,
+        textColor=C_MID),
+    "value": _s("value",
+        fontName="Helvetica", fontSize=9, leading=12,
+        textColor=C_DARK),
+    "toc": _s("toc",
+        fontName="Helvetica", fontSize=10, leading=16,
+        textColor=C_DARK, leftIndent=8),
+    "toc_sub": _s("toc_sub",
+        fontName="Helvetica", fontSize=9, leading=14,
+        textColor=C_MID, leftIndent=22),
+    "sme": _s("sme",
+        fontName="Helvetica-BoldOblique", fontSize=8.5, leading=12,
+        textColor=colors.HexColor("#b45309")),
+    "reg": _s("reg",
+        fontName="Helvetica-Oblique", fontSize=8, leading=11,
+        textColor=C_BLUE),
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# HELPER FLOWABLES
+# ═══════════════════════════════════════════════════════════════════════════
+class Bookmark(Flowable):
+    def __init__(self, key, title, level=0):
+        super().__init__()
+        self.key, self.title, self.level = key, title, level
+        self.width = self.height = 0
+    def wrap(self, aw, ah): return 0, 0
+    def draw(self):
+        self.canv.bookmarkPage(self.key)
+        self.canv.addOutlineEntry(self.title, self.key, level=self.level, closed=False)
 
-def cmd_web_fallback(args: argparse.Namespace) -> None:
-    engine_choice = args.engine or "all"
-    engines_to_run = list(ENGINES.keys()) if engine_choice == "all" else [engine_choice]
+class DraftBanner(Flowable):
+    """Amber DRAFT banner that spans the content width."""
+    def __init__(self, width):
+        super().__init__()
+        self.width = width
+        self.height = 18
+    def wrap(self, aw, ah):
+        return self.width, self.height
+    def draw(self):
+        c = self.canv
+        c.setFillColor(colors.HexColor("#fef3c7"))
+        c.setStrokeColor(colors.HexColor("#d97706"))
+        c.setLineWidth(0.6)
+        c.roundRect(0, 0, self.width, self.height - 2, 3, fill=1, stroke=1)
+        c.setFont("Helvetica-Bold", 7)
+        c.setFillColor(colors.HexColor("#92400e"))
+        c.drawCentredString(self.width / 2, 5, DRAFT_NOTICE)
 
-    if "ddg" not in engines_to_run:
-        engines_to_run.append("ddg")  # baseline is always included for "all"-style robustness
+def anchor(key):
+    return Paragraph(f'<a name="{key}"/>', _s("_a", fontSize=1, leading=1))
 
-    all_results = []
-    seen_urls = set()
-    skipped = []
-    errors = []
+def hr(thick=0.5, c=C_RULE):
+    return HRFlowable(width="100%", thickness=thick, color=c,
+                      spaceBefore=3, spaceAfter=5)
 
-    for name in engines_to_run:
-        fn = ENGINES.get(name)
-        if fn is None:
-            continue
-        results, err = fn(args.query, args.limit)
-        if err:
-            errors.append(err)
-            continue
-        if not results and name != "ddg":
-            skipped.append(name)  # likely no key configured
-            continue
-        for r in results:
-            url = r.get("url")
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                all_results.append(r)
+def sp(h=6): return Spacer(1, h)
 
-    if not all_results and not errors:
-        emit_error(
-            f"No results found for '{args.query}' across configured engines.",
-            hint="Retry once with a reworded/broader query before giving up.",
-            exit_code=10,
-        )
+# ═══════════════════════════════════════════════════════════════════════════
+# TABLE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+def kv_table(pairs, lw=5*cm):
+    rows = [[Paragraph(k, ST["label"]), Paragraph(v, ST["value"])]
+            for k, v in pairs if v]
+    if not rows: return None
+    t = Table(rows, colWidths=[lw, CONTENT_W - lw], hAlign="LEFT")
+    t.setStyle(TableStyle([
+        ("VALIGN",          (0,0),(-1,-1), "TOP"),
+        ("ROWBACKGROUNDS",  (0,0),(-1,-1), [C_WHITE, C_SHADE]),
+        ("LINEBELOW",       (0,0),(-1,-1), 0.3, C_RULE),
+        ("LEFTPADDING",     (0,0),(-1,-1), 5),
+        ("RIGHTPADDING",    (0,0),(-1,-1), 5),
+        ("TOPPADDING",      (0,0),(-1,-1), 3),
+        ("BOTTOMPADDING",   (0,0),(-1,-1), 3),
+    ]))
+    return t
 
-    emit({
-        "query": args.query,
-        "engines_attempted": engines_to_run,
-        "engines_skipped_no_key": skipped,
-        "engine_errors": errors,
-        "result_count": len(all_results),
-        "results": all_results[: args.limit * len(engines_to_run) if engine_choice == "all" else args.limit],
-    })
+def grid_table(headers, rows, widths=None):
+    if not rows: return None
+    hrow = [Paragraph(h, ST["label"]) for h in headers]
+    brows = [[Paragraph(str(c), ST["value"]) for c in r] for r in rows]
+    cw = widths or [CONTENT_W / len(headers)] * len(headers)
+    t = Table([hrow] + brows, colWidths=cw, hAlign="LEFT", repeatRows=1)
+    t.setStyle(TableStyle([
+        ("BACKGROUND",      (0,0),(-1,0),   C_NAVY),
+        ("TEXTCOLOR",       (0,0),(-1,0),   C_WHITE),
+        ("FONTNAME",        (0,0),(-1,0),   "Helvetica-Bold"),
+        ("FONTSIZE",        (0,0),(-1,0),   8),
+        ("ROWBACKGROUNDS",  (0,1),(-1,-1),  [C_WHITE, C_SHADE]),
+        ("LINEBELOW",       (0,0),(-1,-1),  0.3, C_RULE),
+        ("VALIGN",          (0,0),(-1,-1),  "TOP"),
+        ("LEFTPADDING",     (0,0),(-1,-1),  5),
+        ("RIGHTPADDING",    (0,0),(-1,-1),  5),
+        ("TOPPADDING",      (0,0),(-1,-1),  3),
+        ("BOTTOMPADDING",   (0,0),(-1,-1),  3),
+    ]))
+    return t
+
+def sme(text):
+    return Paragraph(f"[SME-INPUT-REQUIRED: {text}]", ST["sme"])
+
+def reg_ref(*refs):
+    return Paragraph(" | ".join(refs), ST["reg"])
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DIAGRAM GENERATORS
+# ═══════════════════════════════════════════════════════════════════════════
+_PLT_DEFAULTS = {
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Helvetica", "Arial", "DejaVu Sans"],
+    "text.color": "#374151",
+    "axes.labelcolor": "#374151",
+    "xtick.color": "#6b7280",
+    "ytick.color": "#6b7280",
+}
+
+def _apply_defaults():
+    for k, v in _PLT_DEFAULTS.items():
+        plt.rcParams[k] = v
+
+def gen_vmodel(device_name: str, tmp_dir: str) -> str:
+    """V-Model lifecycle diagram."""
+    _apply_defaults()
+    fig, ax = plt.subplots(figsize=(7, 3.2))
+    ax.axis("off")
+    ax.set_xlim(0, 14)
+    ax.set_ylim(0, 6)
+
+    left_phases  = ["User Needs",  "Design Inputs", "Design Outputs",   "Build / Prototype"]
+    right_phases = ["Validation",  "Verification",  "Design Review",    "Unit Testing"]
+    colors_l = ["#2563a8","#1b3a5c","#0d9488","#16a34a"]
+    colors_r = ["#2563a8","#1b3a5c","#0d9488","#16a34a"]
+
+    # Draw V shape
+    xs = [1, 3, 5, 7,  7, 9, 11, 13]
+    ys = [5, 4, 3, 1.2, 1.2, 3,  4,  5]
+    ax.plot(xs[:4],  ys[:4],  color="#2563a8", lw=2.2, zorder=2)
+    ax.plot(xs[3:],  ys[3:],  color="#0d9488", lw=2.2, zorder=2)
+
+    for i, (ph, col) in enumerate(zip(left_phases, colors_l)):
+        ax.scatter(xs[i], ys[i], color=col, s=90, zorder=4)
+        ax.text(xs[i]-0.15, ys[i]+0.3, ph, fontsize=8, ha="right",
+                color=col, fontweight="bold")
+
+    for i, (ph, col) in enumerate(zip(right_phases, colors_r)):
+        j = i + 4
+        ax.scatter(xs[j], ys[j], color=col, s=90, zorder=4)
+        ax.text(xs[j]+0.15, ys[j]+0.3, ph, fontsize=8, ha="left",
+                color=col, fontweight="bold")
+
+    # Horizontal dashed lines linking left↔right
+    for i in range(4):
+        ax.annotate("", xy=(xs[7-i], ys[7-i]+0.05),
+                    xytext=(xs[i], ys[i]+0.05),
+                    arrowprops=dict(arrowstyle="<->", color=colors_l[i],
+                                   lw=0.8, linestyle="dashed"))
+
+    ax.text(7, 0.5, "Design Transfer", fontsize=8, ha="center",
+            color="#d97706", fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", fc="#fef3c7", ec="#d97706", lw=0.8))
+    ax.set_title(f"{device_name} — Design Control V-Model",
+                 fontsize=10, fontweight="bold", color="#0f1923", pad=8)
+    plt.tight_layout()
+    out = os.path.join(tmp_dir, "vmodel.png")
+    plt.savefig(out, dpi=180, bbox_inches="tight")
+    plt.close()
+    return out
 
 
-# --------------------------------------------------------------------------- #
-# github-fallback
-# --------------------------------------------------------------------------- #
+def gen_iso14971(tmp_dir: str) -> str:
+    """ISO 14971 Risk Management process flow."""
+    _apply_defaults()
+    stages = [
+        ("Risk Management\nPlanning",     "#2563a8"),
+        ("Hazard\nIdentification",        "#1b3a5c"),
+        ("Risk Estimation\n& Evaluation", "#0d9488"),
+        ("Risk Control",                  "#16a34a"),
+        ("Residual Risk\nEvaluation",     "#d97706"),
+        ("Benefit-Risk\nAnalysis",        "#7c3aed"),
+        ("Risk Management\nReport",       "#c0392b"),
+    ]
+    fig, ax = plt.subplots(figsize=(7, 2.5))
+    ax.axis("off")
+    ax.set_xlim(0, len(stages)*2+0.5)
+    ax.set_ylim(0, 2.5)
 
-def cmd_github_fallback(args: argparse.Namespace) -> None:
-    token = os.environ.get("GITHUB_TOKEN")
-    headers = {"Accept": "application/vnd.github+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    for i, (label, col) in enumerate(stages):
+        x = i * 2 + 0.5
+        rect = mpatches.FancyBboxPatch((x, 0.6), 1.5, 1.2,
+            boxstyle="round,pad=0.1", fc=col, ec="white", lw=1, alpha=0.88)
+        ax.add_patch(rect)
+        ax.text(x+0.75, 1.2, label, ha="center", va="center",
+                color="white", fontsize=6.5, fontweight="bold")
+        if i < len(stages)-1:
+            ax.annotate("", xy=(x+1.65, 1.2), xytext=(x+1.5, 1.2),
+                        arrowprops=dict(arrowstyle="->", color="#6b7280", lw=1.2))
 
-    search_type = args.type or "repositories"
-    if search_type not in ("repositories", "code", "users"):
-        emit_error(f"Invalid --type '{search_type}'. Must be repositories, code, or users.", exit_code=2)
+    ax.text(len(stages), 0.2,
+            "Feedback loop: production & post-production information → repeat",
+            fontsize=7, ha="center", color="#6b7280", style="italic")
+    ax.set_title("ISO 14971:2019 Risk Management Process", fontsize=9,
+                 fontweight="bold", color="#0f1923", pad=6)
+    plt.tight_layout()
+    out = os.path.join(tmp_dir, "iso14971.png")
+    plt.savefig(out, dpi=180, bbox_inches="tight")
+    plt.close()
+    return out
 
-    resp, transport_err = http_get(
-        f"https://api.github.com/search/{search_type}",
-        params={"q": args.query, "per_page": min(args.limit, 50)},
-        headers=headers,
+
+def gen_risk_matrix(tmp_dir: str) -> str:
+    """5×5 risk acceptability heat-map matrix."""
+    _apply_defaults()
+    sev  = ["Negligible", "Minor", "Serious", "Critical", "Catastrophic"]
+    prob = ["Improbable", "Remote", "Occasional", "Probable", "Frequent"]
+    matrix = np.array([
+        [1,1,2,2,3],
+        [1,2,2,3,3],
+        [2,2,3,3,4],
+        [2,3,3,4,4],
+        [3,3,4,4,5],
+    ])
+    palette = {1:"#d1fae5",2:"#fef3c7",3:"#fed7aa",4:"#fca5a5",5:"#ef4444"}
+    labels  = {1:"Acceptable",2:"ALARP",3:"Undesirable",4:"Unacceptable",5:"Intolerable"}
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    for r in range(5):
+        for c in range(5):
+            val = matrix[r, c]
+            ax.add_patch(plt.Rectangle((c, 4-r), 1, 1,
+                color=palette[val], ec="white", lw=1.2))
+            ax.text(c+0.5, 4-r+0.5, labels[val],
+                    ha="center", va="center", fontsize=7,
+                    color="#111827", fontweight="bold" if val >= 4 else "normal")
+
+    ax.set_xlim(0, 5); ax.set_ylim(0, 5)
+    ax.set_xticks([i+0.5 for i in range(5)])
+    ax.set_xticklabels(sev, fontsize=7.5, rotation=20, ha="right")
+    ax.set_yticks([i+0.5 for i in range(5)])
+    ax.set_yticklabels(reversed(prob), fontsize=7.5)
+    ax.set_xlabel("Severity →", fontsize=8, color="#374151")
+    ax.set_ylabel("← Probability", fontsize=8, color="#374151")
+    ax.set_title("Risk Acceptability Matrix (5×5)", fontsize=9,
+                 fontweight="bold", color="#0f1923", pad=8)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    plt.tight_layout()
+    out = os.path.join(tmp_dir, "risk_matrix.png")
+    plt.savefig(out, dpi=180, bbox_inches="tight")
+    plt.close()
+    return out
+
+
+def gen_block_diagram(device_name: str, tmp_dir: str) -> str:
+    """Functional block diagram."""
+    _apply_defaults()
+    blocks = [
+        ("Input\nSubsystem",    "#2563a8", 1.0),
+        ("Core\nProcessing",    "#1b3a5c", 3.5),
+        ("Output\nSubsystem",   "#0d9488", 6.0),
+    ]
+    fig, ax = plt.subplots(figsize=(6, 2.0))
+    ax.axis("off")
+    ax.set_xlim(0, 8); ax.set_ylim(0, 3)
+
+    for label, col, x in blocks:
+        rect = mpatches.FancyBboxPatch((x, 0.6), 1.6, 1.4,
+            boxstyle="round,pad=0.15", fc=col, ec="white", lw=1.2, alpha=0.9)
+        ax.add_patch(rect)
+        ax.text(x+0.8, 1.3, label, ha="center", va="center",
+                color="white", fontsize=8.5, fontweight="bold")
+
+    for x_from, x_to in [(2.6, 3.5), (5.1, 6.0)]:
+        ax.annotate("", xy=(x_to, 1.3), xytext=(x_from, 1.3),
+                    arrowprops=dict(arrowstyle="->", color="#6b7280", lw=1.5))
+
+    ax.set_title(f"{device_name} — Functional Block Diagram",
+                 fontsize=9, fontweight="bold", color="#0f1923", pad=6)
+    plt.tight_layout()
+    out = os.path.join(tmp_dir, "block_diagram.png")
+    plt.savefig(out, dpi=180, bbox_inches="tight")
+    plt.close()
+    return out
+
+
+def gen_sw_classification(tmp_dir: str) -> str:
+    """IEC 62304 software safety classification decision tree."""
+    _apply_defaults()
+    fig, ax = plt.subplots(figsize=(6.5, 3.0))
+    ax.axis("off")
+    ax.set_xlim(0, 10); ax.set_ylim(0, 5)
+
+    def box(x, y, w, h, text, col, tcol="white", fs=8):
+        r = mpatches.FancyBboxPatch((x-w/2, y-h/2), w, h,
+            boxstyle="round,pad=0.1", fc=col, ec="white", lw=1, alpha=0.9)
+        ax.add_patch(r)
+        ax.text(x, y, text, ha="center", va="center",
+                color=tcol, fontsize=fs, fontweight="bold")
+
+    def arr(x1, y1, x2, y2, label=""):
+        ax.annotate("", xy=(x2,y2), xytext=(x1,y1),
+                    arrowprops=dict(arrowstyle="->", color="#6b7280", lw=1.2))
+        if label:
+            mx, my = (x1+x2)/2, (y1+y2)/2
+            ax.text(mx+0.15, my, label, fontsize=7, color="#6b7280")
+
+    box(5, 4.3, 4, 0.8, "Software in medical device?", "#374151", "white", 8)
+    arr(5, 3.9, 5, 3.2)
+    box(5, 2.9, 3.5, 0.6, "Hazardous situation\nif software fails?", "#374151", "white", 7.5)
+    arr(5, 2.6, 5, 1.9)
+    box(5, 1.6, 3.5, 0.6, "Severity: serious\ninjury or death?", "#374151", "white", 7.5)
+    arr(3.25, 2.9, 1.5, 1.6)
+    box(1.5, 1.3, 2.2, 0.6, "Class A\n(No hazard)", "#16a34a")
+    arr(5, 1.3, 6.8, 0.7)
+    box(7, 0.5, 2.2, 0.6, "Class B\n(Non-fatal)", "#d97706")
+    arr(5, 1.6, 3.2, 0.5)
+    box(3.0, 0.3, 2.2, 0.6, "Class C\n(Fatal / serious)", "#c0392b")
+
+    ax.text(3.5, 3.0, "No", fontsize=7, color="#16a34a", fontweight="bold")
+    ax.text(5.2, 2.3, "Yes", fontsize=7, color="#c0392b", fontweight="bold")
+    ax.text(5.2, 1.55, "No", fontsize=7, color="#d97706", fontweight="bold")
+    ax.text(4.3, 1.0, "Yes", fontsize=7, color="#c0392b", fontweight="bold")
+
+    ax.set_title("IEC 62304 Software Safety Classification",
+                 fontsize=9, fontweight="bold", color="#0f1923", pad=6)
+    plt.tight_layout()
+    out = os.path.join(tmp_dir, "sw_classification.png")
+    plt.savefig(out, dpi=180, bbox_inches="tight")
+    plt.close()
+    return out
+
+
+def gen_traceability_overview(tmp_dir: str) -> str:
+    """Linear traceability chain bar-chart style."""
+    _apply_defaults()
+    nodes = ["User Needs", "Design\nInputs", "Design\nOutputs",
+             "Verification", "Validation", "Risk\nControls"]
+    cols  = ["#2563a8","#1b3a5c","#0d9488","#16a34a","#7c3aed","#c0392b"]
+
+    fig, ax = plt.subplots(figsize=(7, 1.8))
+    ax.axis("off")
+    ax.set_xlim(0, len(nodes)*2.2)
+    ax.set_ylim(0, 2)
+
+    for i, (n, c) in enumerate(zip(nodes, cols)):
+        x = i * 2.2 + 0.2
+        rect = mpatches.FancyBboxPatch((x, 0.4), 1.8, 1.1,
+            boxstyle="round,pad=0.12", fc=c, ec="white", lw=1, alpha=0.88)
+        ax.add_patch(rect)
+        ax.text(x+0.9, 0.95, n, ha="center", va="center",
+                color="white", fontsize=7.5, fontweight="bold")
+        if i < len(nodes)-1:
+            ax.annotate("", xy=(x+2.1, 0.95), xytext=(x+1.8, 0.95),
+                        arrowprops=dict(arrowstyle="->", color="#6b7280", lw=1.2))
+
+    ax.set_title("DHF Traceability Chain", fontsize=9,
+                 fontweight="bold", color="#0f1923", pad=5)
+    plt.tight_layout()
+    out = os.path.join(tmp_dir, "traceability.png")
+    plt.savefig(out, dpi=180, bbox_inches="tight")
+    plt.close()
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CANVAS FOOTER
+# ═══════════════════════════════════════════════════════════════════════════
+class Footer:
+    def __init__(self, device_name):
+        self.device = device_name
+
+    def __call__(self, canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(C_LIGHT)
+        canvas.setFont("Helvetica", 7)
+        canvas.drawString(MARGIN, 0.9*cm,
+            f"DHF — {self.device}  ·  DRAFT — AI-ASSISTED  ·  {date.today().isoformat()}")
+        canvas.drawRightString(PAGE_W - MARGIN, 0.9*cm, f"Page {doc.page}")
+        canvas.setStrokeColor(C_RULE)
+        canvas.setLineWidth(0.4)
+        canvas.line(MARGIN, 1.1*cm, PAGE_W - MARGIN, 1.1*cm)
+        canvas.restoreState()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION BUILDERS
+# ═══════════════════════════════════════════════════════════════════════════
+def section_header(story, num, title, key):
+    story += [
+        Bookmark(key, f"{num}. {title}"),
+        anchor(key),
+        Paragraph(f"{num}. {title}", ST["h1"]),
+        hr(1.2, C_NAVY),
+    ]
+
+def cover_page(story, intake):
+    today = date.today().isoformat()
+    # Solid dark background simulation using a wide Table cell
+    cover_bg = Table(
+        [[Paragraph(intake["device_name"], ST["cover_title"])]],
+        colWidths=[CONTENT_W],
     )
-    if transport_err:
-        emit_error(f"Network error calling GitHub: {transport_err['error']}", exit_code=3)
+    cover_bg.setStyle(TableStyle([
+        ("BACKGROUND",      (0,0),(-1,-1), C_NAVY),
+        ("TOPPADDING",      (0,0),(-1,-1), 28),
+        ("BOTTOMPADDING",   (0,0),(-1,-1), 28),
+        ("LEFTPADDING",     (0,0),(-1,-1), 16),
+        ("RIGHTPADDING",    (0,0),(-1,-1), 16),
+        ("ROUNDEDCORNERS",  (0,0),(-1,-1), [6,6,6,6]),
+    ]))
+    story += [
+        sp(40),
+        cover_bg,
+        sp(16),
+        Paragraph("Design History File", ST["cover_sub"]),
+        sp(6),
+        Paragraph(f"Model: {intake.get('model_number','[TBD]')}  ·  "
+                  f"FDA Class {intake.get('fda_class','?')}  ·  "
+                  f"EU MDR Class {intake.get('eu_mdr_class','?')}",
+                  ST["cover_meta"]),
+        sp(8),
+        Paragraph(f"Compiled {today}  ·  Target markets: "
+                  f"{', '.join(intake.get('target_markets', []))}",
+                  ST["cover_meta"]),
+        sp(30),
+        DraftBanner(CONTENT_W),
+        PageBreak(),
+    ]
 
-    if resp.status_code == 403:
-        emit_error(
-            "GitHub rate-limited this request.",
-            status=403,
-            hint="Unauthenticated requests are limited to 10/min; set GITHUB_TOKEN to raise it. "
-                 "Wait a minute and retry, or continue with other sources.",
-            exit_code=6,
+def toc(story):
+    sections = [
+        ("1", "DHF Index & Document Register",   "sec1"),
+        ("2", "Design & Development Plan",        "sec2"),
+        ("3", "Design Inputs",                    "sec3"),
+        ("4", "Design Outputs",                   "sec4"),
+        ("5", "Design Review Records",             "sec5"),
+        ("6", "Design Verification",               "sec6"),
+        ("7", "Design Validation",                 "sec7"),
+        ("8", "Design Transfer",                   "sec8"),
+        ("9", "Design Change Log",                 "sec9"),
+        ("10", "Risk Management File",             "sec10"),
+        ("11", "Traceability Matrix",              "sec11"),
+        ("A",  "CSV Considerations",               "secA"),
+    ]
+    story += [
+        Bookmark("toc", "Table of Contents"),
+        anchor("toc"),
+        Paragraph("Table of Contents", ST["h1"]),
+        hr(1.2, C_NAVY),
+        sp(4),
+    ]
+    for num, title, key in sections:
+        story.append(Paragraph(
+            f'<link href="#{key}">{num}.&nbsp;&nbsp;{title}</link>',
+            ST["toc"]))
+    story.append(PageBreak())
+
+def sec_dhf_index(story, intake):
+    today = date.today().isoformat()
+    section_header(story, 1, "DHF Index & Document Register", "sec1")
+    story += [
+        reg_ref("21 CFR 820.30(j)", "ISO 13485:2016 §7.3.10"),
+        sp(4),
+        kv_table([
+            ("Device name",     intake["device_name"]),
+            ("Model number",    intake.get("model_number","[TBD]")),
+            ("FDA class",       f"Class {intake.get('fda_class','[SME]')}"),
+            ("EU MDR class",    f"Class {intake.get('eu_mdr_class','[SME]')}"),
+            ("Target markets",  ", ".join(intake.get("target_markets",[]))),
+            ("Compiled",        today),
+            ("Compiled by",     "[SME-INPUT-REQUIRED]"),
+        ]),
+        sp(8),
+        Paragraph("Master Document Register", ST["h2"]),
+        grid_table(
+            ["Doc ID","Title","Type","Rev","Effective Date","Approver"],
+            [
+                ["00","DHF Index","Index","A",today,"[SME]"],
+                ["01","Design & Development Plan","Plan","A",today,"[SME]"],
+                ["02","Design Inputs","Spec","A",today,"[SME]"],
+                ["03","Design Outputs","Spec","A",today,"[SME]"],
+                ["04","Design Review Records","Record","A",today,"[SME]"],
+                ["05","Design Verification","Plan/Report","A",today,"[SME]"],
+                ["06","Design Validation","Plan/Report","A",today,"[SME]"],
+                ["07","Design Transfer","Plan","A",today,"[SME]"],
+                ["08","Design Change Log","Record","A",today,"[SME]"],
+                ["09","Risk Management File","RMF","A",today,"[SME]"],
+                ["10","Traceability Matrix","Matrix","A",today,"[SME]"],
+            ],
+            widths=[1.4*cm, 5.2*cm, 2.4*cm, 1.0*cm, 3.0*cm, CONTENT_W-13.0*cm]
+        ),
+        sp(6),
+        Paragraph("Records Retention",  ST["h2"]),
+        Paragraph(
+            "Per 21 CFR 820.180 and ISO 13485:2016 §4.2.5: device lifetime "
+            "+ statutory retention period (commonly 10–15 years post-end-of-life, "
+            "market-dependent). Original signed records must be retained in the "
+            "controlled QMS document management system.", ST["body"]),
+        PageBreak(),
+    ]
+
+def sec_ddplan(story, intake, imgs):
+    section_header(story, 2, "Design & Development Plan", "sec2")
+    story += [
+        DraftBanner(CONTENT_W), sp(4),
+        reg_ref("21 CFR 820.30(b)", "ISO 13485:2016 §7.3.2", "EU MDR Annex II §3"),
+        sp(4),
+        Paragraph("1. Purpose & Scope", ST["h2"]),
+        Paragraph(
+            f"This plan describes design and development activities, responsibilities, "
+            f"interfaces, and review gates for the {intake['device_name']}. "
+            "All design activities shall follow this plan; deviations require formal "
+            "change control.", ST["body"]),
+        sp(4),
+        Paragraph("2. Device Description & Intended Use", ST["h2"]),
+        kv_table([
+            ("Intended use",        intake["intended_use"]),
+            ("Indications for use", intake["indications_for_use"]),
+            ("Predicate / equiv.",  intake.get("predicate_device","[SME-INPUT-REQUIRED]")),
+        ]),
+        sp(6),
+        Paragraph("3. Regulatory Classification", ST["h2"]),
+        kv_table([
+            ("FDA classification",  f"Class {intake.get('fda_class','[SME]')} "
+                                    "— submission pathway TBD per SME"),
+            ("EU MDR classification", f"Class {intake.get('eu_mdr_class','[SME]')}"),
+            ("Patient contacting",  "Yes" if intake.get("patient_contacting") else "No"),
+            ("Sterile",             "Yes" if intake.get("sterile") else "No"),
+            ("Contains software",   "Yes (IEC 62304 applies)" if intake.get("contains_software") else "No"),
+            ("Implantable",         "Yes" if intake.get("implantable") else "No"),
+            ("Reusable",            "Yes" if intake.get("reusable") else "No"),
+            ("Electromedical",      "Yes (IEC 60601-1 applies)" if intake.get("electromedical") else "No"),
+        ]),
+        sp(8),
+        Paragraph("4. Design Control V-Model", ST["h2"]),
+        Image(imgs["vmodel"], width=CONTENT_W, height=3.6*cm),
+        Paragraph("Figure 2.1: Design Control V-Model — horizontal dashed lines indicate "
+                  "V&V traceability. Source: AI-generated; verify before regulatory use.",
+                  ST["caption"]),
+        sp(6),
+        Paragraph("5. Design & Development Phases", ST["h2"]),
+        grid_table(
+            ["Phase","Name","Key Activities","Exit Criteria"],
+            [
+                ["0","Concept / Feasibility","Market research, predicate analysis","Feasibility report approved"],
+                ["1","Design Inputs","User needs → requirements, risk identification","DI document baselined"],
+                ["2","Design & Prototyping","Prototype build, bench tests","Prototype test report"],
+                ["3","Design Verification","V&V per test protocols","All acceptance criteria met"],
+                ["4","Design Validation","Simulated-use / clinical validation","Validation report approved"],
+                ["5","Design Transfer","DMR, manufacturing release","Transfer checklist signed"],
+                ["6","Post-Market","PMS, PSUR, complaint handling","Ongoing"],
+            ],
+            widths=[1.2*cm, 3.6*cm, 5.0*cm, CONTENT_W-9.8*cm]
+        ),
+        sp(6),
+        Paragraph("6. Roles & Responsibilities", ST["h2"]),
+        grid_table(
+            ["Role","Function","Responsibility"],
+            [
+                ["Project Lead","[SME]","Overall DHF ownership"],
+                ["R&D Engineer","[SME]","Design execution"],
+                ["Quality Engineer","[SME]","QMS conformance, document control"],
+                ["Regulatory Lead","[SME]","Submission strategy"],
+                ["Clinical Lead","[SME]","Clinical evaluation, validation"],
+                ["Independent Reviewer","[SME]","Per 21 CFR 820.30(e)"],
+            ],
+            widths=[3.2*cm, 3.2*cm, CONTENT_W-6.4*cm]
+        ),
+        sp(6),
+        Paragraph("7. Design Review Gates", ST["h2"]),
+        grid_table(
+            ["Gate","Review","Planned Date","Mandatory Reviewers"],
+            [
+                ["G0","Concept Review","[DATE]","Project Lead, Regulatory"],
+                ["G1","Inputs Frozen","[DATE]","All functions"],
+                ["G2","Design Complete","[DATE]","All functions + Independent"],
+                ["G3","V&V Complete","[DATE]","QA, Regulatory, Clinical"],
+                ["G4","Transfer Approved","[DATE]","QA, Manufacturing, QC"],
+                ["G5","Launch Release","[DATE]","Management sign-off"],
+            ],
+            widths=[1.2*cm, 3.5*cm, 3.0*cm, CONTENT_W-7.7*cm]
+        ),
+        PageBreak(),
+    ]
+
+def sec_design_inputs(story, intake, imgs):
+    section_header(story, 3, "Design Inputs", "sec3")
+    story += [
+        DraftBanner(CONTENT_W), sp(4),
+        reg_ref("21 CFR 820.30(c)", "ISO 13485:2016 §7.3.3", "EU MDR Annex II §3"),
+        sp(4),
+        Paragraph(
+            f"Defines physical, performance, safety, and regulatory requirements "
+            f"the {intake['device_name']} must meet prior to design output generation.",
+            ST["body"]),
+        sp(4),
+        Paragraph("1. Functional Block Diagram", ST["h2"]),
+        Image(imgs["block"], width=CONTENT_W, height=2.2*cm),
+        Paragraph("Figure 3.1: Functional decomposition. Source: AI-generated stub — "
+                  "expand with actual subsystems.", ST["caption"]),
+        sp(6),
+        Paragraph("2. User Needs", ST["h2"]),
+        grid_table(
+            ["UN-ID","User Need","Intended User","Source"],
+            [["UN-001","[SME-INPUT-REQUIRED]","[Clinical user]","[VOC / predicate analysis]"]],
+            widths=[1.5*cm, 5.5*cm, 3.5*cm, CONTENT_W-10.5*cm]
+        ),
+        sp(6),
+        Paragraph("3. Functional / Performance Requirements", ST["h2"]),
+        grid_table(
+            ["DI-ID","Requirement","Source","Acceptance Criterion","Verification Method"],
+            [["DI-F-001","[SME-INPUT-REQUIRED]","UN-001","[SME-VALUE]","[SME-METHOD]"]],
+            widths=[1.8*cm, 4.5*cm, 2.0*cm, 3.5*cm, CONTENT_W-11.8*cm]
+        ),
+        sp(4),
+        sme("Add all functional/performance requirements with quantified acceptance criteria."),
+        sp(6),
+        Paragraph("4. Additional Requirement Categories", ST["h2"]),
+    ]
+
+    categories = [
+        ("4.1 Mechanical / Physical", "[SME-INPUT-REQUIRED: dimensions, materials, mechanical loads]"),
+        ("4.2 Electrical", ("IEC 60601-1 and IEC 60601-1-2 (EMC) apply — "
+                            "[SME-INPUT-REQUIRED]")
+         if intake.get("electromedical") else "Not applicable — non-electromedical device."),
+        ("4.3 Biocompatibility",
+         f"ISO 10993-1 biological evaluation required — "
+         f"contact category: {'implant' if intake.get('implantable') else 'surface'}; "
+         f"duration: {'long-term (>30 days)' if intake.get('implantable') else 'limited (<24 h)'}. "
+         "[SME-INPUT-REQUIRED: material characterisation data]"
+         if intake.get("patient_contacting") else "Not applicable."),
+        ("4.4 Sterility",
+         "SAL 10<super>-6</super> required — applicable sterilization standard per SME "
+         "(ISO 11135 / ISO 11137 / ISO 17665). [SME-INPUT-REQUIRED]"
+         if intake.get("sterile") else "Not applicable — device is non-sterile."),
+        ("4.5 Software (IEC 62304)",
+         "Safety classification per IEC 62304 §4.3 must be determined. See Figure 3.2 below. "
+         "[SME-INPUT-REQUIRED]"
+         if intake.get("contains_software") else "Not applicable — no software."),
+        ("4.6 Cybersecurity",
+         "Per FDA premarket cybersecurity guidance (2023) and IEC 81001-5-1. "
+         "[SME-INPUT-REQUIRED]"
+         if intake.get("contains_software") else "Not applicable."),
+        ("4.7 Cleaning / Reprocessing",
+         "ISO 17664 validation required — reusable device. [SME-INPUT-REQUIRED]"
+         if intake.get("reusable") else "Not applicable — single-use device."),
+        ("4.8 Shelf Life / Stability", "Per ASTM F1980 accelerated aging. [SME-INPUT-REQUIRED]"),
+        ("4.9 Usability / Human Factors", "Per IEC 62366-1 and FDA HF guidance (2016). [SME-INPUT-REQUIRED]"),
+        ("4.10 Labelling & IFU", "Per 21 CFR 801, EU MDR Annex I §23, ISO 15223-1 symbols. [SME-INPUT-REQUIRED]"),
+        ("4.11 Risk-Derived Inputs", "Risk control measures from RMF that become design inputs. [SME-INPUT-REQUIRED]"),
+    ]
+    for title, body in categories:
+        story += [Paragraph(title, ST["h3"]), Paragraph(body, ST["body"])]
+
+    if intake.get("contains_software"):
+        story += [
+            sp(4),
+            Paragraph("IEC 62304 Software Safety Classification Tree", ST["h2"]),
+            Image(imgs["sw_class"], width=CONTENT_W*0.8, height=3.4*cm),
+            Paragraph("Figure 3.2: IEC 62304 software safety classification. "
+                      "Source: AI-generated.", ST["caption"]),
+        ]
+    story.append(PageBreak())
+
+def _simple_section(story, num, title, key, reg, device_name, subsections, note=""):
+    section_header(story, num, title, key)
+    story += [
+        DraftBanner(CONTENT_W), sp(4),
+        Paragraph(reg, ST["reg"]), sp(6),
+    ]
+    if note:
+        story.append(Paragraph(note, ST["body"]))
+        story.append(sp(4))
+    for heading, body in subsections:
+        story += [Paragraph(heading, ST["h2"]), Paragraph(body, ST["body"]), sp(2)]
+    story.append(PageBreak())
+
+def sec_design_outputs(story, intake):
+    _simple_section(story, 4, "Design Outputs", "sec4",
+        "21 CFR 820.30(d) | ISO 13485:2016 §7.3.4",
+        intake["device_name"],
+        [
+            ("1. Device Master Record (DMR) Index",
+             "DMR shall include: drawings, specifications, BOM, manufacturing procedures, "
+             "quality plans, labelling, and packaging specifications. [SME-INPUT-REQUIRED]"),
+            ("2. Essential Design Outputs Table",
+             "Identify outputs that are essential to proper functioning (21 CFR 820.30(d)). "
+             "[SME-INPUT-REQUIRED: complete output list with document references]"),
+            ("3. Drawings & Specifications",
+             "Engineering drawings shall be revision-controlled per the QMS. "
+             "[SME-INPUT-REQUIRED]"),
+            ("4. Bill of Materials (BOM)",
+             "Full BOM with part numbers, revision levels, and approved suppliers. "
+             "[SME-INPUT-REQUIRED]"),
+            ("5. Approval Block",
+             "[SME-INPUT-REQUIRED: author, reviewer, approver signatures and dates]"),
+        ])
+
+def sec_design_review(story, intake):
+    _simple_section(story, 5, "Design Review Records", "sec5",
+        "21 CFR 820.30(e) | ISO 13485:2016 §7.3.5",
+        intake["device_name"],
+        [
+            ("1. Review Record Template",
+             "Each formal review shall document: date, attendees, agenda, findings, "
+             "action items (owner + due date), and disposition (pass / conditional / fail)."),
+            ("2. Review Schedule",
+             "Reviews planned at each V-model gate (G0–G5). See Section 2 (Design Plan)."),
+            ("3. Independent Reviewer",
+             "At least one reviewer must be independent of the design team per 21 CFR 820.30(e). "
+             "[SME-INPUT-REQUIRED: confirm reviewer identity and independence declaration]"),
+        ])
+
+def sec_verification(story, intake):
+    _simple_section(story, 6, "Design Verification", "sec6",
+        "21 CFR 820.30(f) | ISO 13485:2016 §7.3.6",
+        intake["device_name"],
+        [
+            ("1. Verification Plan",
+             "Verification confirms design outputs meet design inputs. Each DI-ID shall "
+             "have at least one corresponding verification test. [SME-INPUT-REQUIRED: test matrix]"),
+            ("2. Verification Test Summary",
+             "[SME-INPUT-REQUIRED: test ID, method, acceptance criterion, result, pass/fail]"),
+            ("3. Statistical Considerations",
+             "Sample sizes and confidence/reliability levels per applicable standards. "
+             "[SME-INPUT-REQUIRED]"),
+            ("4. Verification Report",
+             "Final report summarising all verification activities. [SME-INPUT-REQUIRED]"),
+        ])
+
+def sec_validation(story, intake):
+    _simple_section(story, 7, "Design Validation", "sec7",
+        "21 CFR 820.30(g) | ISO 13485:2016 §7.3.7 | EU MDR Annex XIV",
+        intake["device_name"],
+        [
+            ("1. Validation Plan",
+             "Validation confirms device meets user needs under actual/simulated conditions "
+             "of use. Simulated-use testing, clinical evaluation, or both may be required. "
+             "[SME-INPUT-REQUIRED]"),
+            ("2. Simulated-Use Testing",
+             "Per IEC 62366-1 usability engineering process. [SME-INPUT-REQUIRED]"),
+            ("3. Clinical Evidence",
+             "Clinical evaluation report per EU MDR Annex XIV and FDA guidance. "
+             "[SME-INPUT-REQUIRED]"),
+            ("4. Validation Report",
+             "Final report summarising all validation activities. [SME-INPUT-REQUIRED]"),
+        ])
+
+def sec_transfer(story, intake):
+    _simple_section(story, 8, "Design Transfer", "sec8",
+        "21 CFR 820.30(h) | ISO 13485:2016 §7.3.8",
+        intake["device_name"],
+        [
+            ("1. Transfer Checklist",
+             "Confirms DMR completeness, manufacturing capability, quality plan, "
+             "training records, and tooling/equipment qualification. [SME-INPUT-REQUIRED]"),
+            ("2. Scale-Up / First Article Inspection",
+             "[SME-INPUT-REQUIRED]"),
+            ("3. Process Validation",
+             "IQ / OQ / PQ for critical manufacturing processes. [SME-INPUT-REQUIRED]"),
+        ])
+
+def sec_change_log(story, intake):
+    section_header(story, 9, "Design Change Log", "sec9")
+    story += [
+        DraftBanner(CONTENT_W), sp(4),
+        reg_ref("21 CFR 820.30(i)", "ISO 13485:2016 §7.3.9"), sp(6),
+        Paragraph(
+            "All design changes after baseline must be documented below and "
+            "assessed for impact on verification, validation, and regulatory status.",
+            ST["body"]), sp(4),
+        grid_table(
+            ["DCR-ID","Description","Initiator","Date","Impact Assessment",
+             "Affected Docs","Approval","Status"],
+            [["DCR-001","[SME-INPUT-REQUIRED]","[SME]","[DATE]",
+              "[SME]","[SME]","[SME]","Open"]],
+            widths=[1.8*cm,4.0*cm,1.8*cm,1.8*cm,2.5*cm,2.0*cm,1.8*cm,
+                    CONTENT_W-15.7*cm]
+        ),
+        PageBreak(),
+    ]
+
+def sec_rmf(story, intake, imgs):
+    section_header(story, 10, "Risk Management File", "sec10")
+    story += [
+        DraftBanner(CONTENT_W), sp(4),
+        reg_ref("ISO 14971:2019", "ISO/TR 24971:2020",
+                "EN ISO 14971:2019/A11:2021 (EU)", "21 CFR 820.30(g)"), sp(6),
+        Paragraph("1. Risk Management Process", ST["h2"]),
+        Image(imgs["iso14971"], width=CONTENT_W, height=2.8*cm),
+        Paragraph("Figure 10.1: ISO 14971:2019 Risk Management Process. "
+                  "Source: AI-generated.", ST["caption"]),
+        sp(6),
+        Paragraph("2. Risk Acceptability Matrix", ST["h2"]),
+        Image(imgs["risk_matrix"], width=CONTENT_W*0.72, height=4.2*cm),
+        Paragraph("Figure 10.2: 5×5 Risk Acceptability Matrix. Severity and probability "
+                  "scale anchors must be confirmed by the risk management team [SME-CONFIRM].",
+                  ST["caption"]),
+        sp(6),
+        Paragraph("3. Severity Scale", ST["h2"]),
+        grid_table(
+            ["Level","Term","Definition"],
+            [
+                ["5","Catastrophic","Patient death"],
+                ["4","Critical","Permanent impairment / life-threatening injury"],
+                ["3","Serious","Injury requiring medical intervention"],
+                ["2","Minor","Temporary discomfort or injury"],
+                ["1","Negligible","Inconvenience or transient minor effect"],
+            ],
+            widths=[1.5*cm, 3.5*cm, CONTENT_W-5.0*cm]
+        ),
+        sp(4),
+        Paragraph("4. Probability Scale", ST["h2"]),
+        grid_table(
+            ["Level","Term","Approx. Frequency"],
+            [
+                ["5","Frequent",   "> 10<super>-3</super> per use"],
+                ["4","Probable",   "10<super>-3</super> – 10<super>-4</super>"],
+                ["3","Occasional", "10<super>-4</super> – 10<super>-5</super>"],
+                ["2","Remote",     "10<super>-5</super> – 10<super>-6</super>"],
+                ["1","Improbable", "< 10<super>-6</super>"],
+            ],
+            widths=[1.5*cm, 3.5*cm, CONTENT_W-5.0*cm]
+        ),
+        sp(6),
+        Paragraph("5. Hazard Identification", ST["h2"]),
+        Paragraph(
+            "Per ISO 14971 §5.4, identify hazards across: energy hazards "
+            "(mechanical, thermal, electrical, radiation), biological & chemical hazards "
+            "(biocompatibility, contamination), operational hazards (function loss, "
+            "unintended function, use error), and information hazards (labelling, "
+            "IFU comprehensibility). [SME-INPUT-REQUIRED: full hazard list]",
+            ST["body"]),
+        sp(4),
+        Paragraph("6. Risk Control Hierarchy (ISO 14971 §7.1)", ST["h2"]),
+        Paragraph("1. Inherent safety by design (most preferred)\n"
+                  "2. Protective measures in device or manufacturing\n"
+                  "3. Information for safety in IFU (least preferred)", ST["body"]),
+        sp(4),
+        Paragraph("7. FMEA Documents", ST["h2"]),
+        Paragraph(
+            "Three FMEAs maintained as separate controlled workbooks: "
+            "dFMEA (Design), pFMEA (Process), uFMEA (Use/Human Factors per IEC 62366-1). "
+            "[SME-INPUT-REQUIRED]", ST["body"]),
+        sp(4),
+        Paragraph("8. Overall Residual Risk Evaluation", ST["h2"]),
+        sme("Benefit-risk analysis per EU MDR Annex I §1 and §8 required here."),
+        PageBreak(),
+    ]
+
+def sec_traceability(story, imgs):
+    section_header(story, 11, "Traceability Matrix", "sec11")
+    story += [
+        DraftBanner(CONTENT_W), sp(4),
+        reg_ref("21 CFR 820.30(j)", "ISO 13485:2016 §7.3.10"), sp(4),
+        Paragraph(
+            "The traceability matrix links every user need through design inputs, "
+            "outputs, verification, validation, and risk controls. Every row must "
+            "be complete before DHF closure.", ST["body"]),
+        sp(4),
+        Image(imgs["traceability"], width=CONTENT_W, height=2.0*cm),
+        Paragraph("Figure 11.1: DHF Traceability Chain. Source: AI-generated.",
+                  ST["caption"]),
+        sp(6),
+        grid_table(
+            ["UN-ID","User Need","DI-ID","Design Input","DO-ID","Design Output",
+             "DV-ID","Verification","DVA-ID","Validation","Risk-ID","Risk Control"],
+            [["UN-001","[SME]","DI-001","[SME]","DO-001","[SME]",
+              "DV-001","[SME]","DVA-001","[SME]","R-001","[SME]"]],
+            widths=[1.3]*12 if False else None
+        ),
+        sp(4),
+        sme("Populate this matrix fully before regulatory submission."),
+        PageBreak(),
+    ]
+
+def sec_csv(story):
+    section_header(story, "A", "CSV Considerations", "secA")
+    story += [
+        DraftBanner(CONTENT_W), sp(4),
+        reg_ref("21 CFR Part 11", "FDA QMSR (2024)", "GAMP 5"), sp(6),
+        Paragraph(
+            "This DHF was generated with AI assistance. Any software producing "
+            "GxP records must be validated for intended use before outputs enter "
+            "the controlled QMS document management system.", ST["body"]),
+        sp(4),
+        Paragraph("Risk Classification (GAMP 5)", ST["h2"]),
+        sme("Typically GAMP Category 5 — bespoke/configured. Confirm with QA."),
+        sp(4),
+        Paragraph("Required Validation Activities", ST["h2"]),
+        grid_table(
+            ["Activity","Description","Owner","Status"],
+            [
+                ["URS","User Requirement Specification","QA","[SME]"],
+                ["FS","Functional Specification","IT/Dev","[SME]"],
+                ["DS","Design Specification","IT/Dev","[SME]"],
+                ["IQ","Installation Qualification","QA","[SME]"],
+                ["OQ","Operational Qualification","QA","[SME]"],
+                ["PQ","Performance Qualification","QA","[SME]"],
+                ["TM","Traceability Matrix URS→FS→DS→tests","QA","[SME]"],
+            ],
+            widths=[1.5*cm, 6.0*cm, 2.5*cm, CONTENT_W-10.0*cm]
+        ),
+        sp(6),
+        Paragraph(
+            "No output from this tool is considered released or controlled until it has "
+            "completed the customer's QMS-controlled review and approval process.",
+            ST["body"]),
+    ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN BUILD FUNCTION
+# ═══════════════════════════════════════════════════════════════════════════
+def build_pdf(intake: dict, output_path: str):
+    with tempfile.TemporaryDirectory() as tmp:
+        print("  Generating diagrams...")
+        imgs = {
+            "vmodel":       gen_vmodel(intake["device_name"], tmp),
+            "iso14971":     gen_iso14971(tmp),
+            "risk_matrix":  gen_risk_matrix(tmp),
+            "block":        gen_block_diagram(intake["device_name"], tmp),
+            "traceability": gen_traceability_overview(tmp),
+        }
+        if intake.get("contains_software"):
+            imgs["sw_class"] = gen_sw_classification(tmp)
+
+        print("  Building PDF story...")
+        doc = SimpleDocTemplate(
+            output_path, pagesize=A4,
+            leftMargin=MARGIN, rightMargin=MARGIN,
+            topMargin=MARGIN, bottomMargin=MARGIN + 0.6*cm,
+            title=f"DHF — {intake['device_name']}",
+            author="dhf_export.py — AI-Assisted Draft",
+            subject="Design History File",
         )
-    if resp.status_code != 200:
-        emit_error(f"Unexpected GitHub response ({resp.status_code}).", status=resp.status_code, exit_code=8)
 
-    data = resp.json()
-    items = data.get("items", [])
+        story = []
+        cover_page(story, intake)
+        toc(story)
+        sec_dhf_index(story, intake)
+        sec_ddplan(story, intake, imgs)
+        sec_design_inputs(story, intake, imgs)
+        sec_design_outputs(story, intake)
+        sec_design_review(story, intake)
+        sec_verification(story, intake)
+        sec_validation(story, intake)
+        sec_transfer(story, intake)
+        sec_change_log(story, intake)
+        sec_rmf(story, intake, imgs)
+        sec_traceability(story, imgs)
+        sec_csv(story)
 
-    if search_type == "repositories":
-        results = [
-            {
-                "name": i.get("full_name"),
-                "url": i.get("html_url"),
-                "description": i.get("description"),
-                "stars": i.get("stargazers_count"),
-                "forks": i.get("forks_count"),
-                "language": i.get("language"),
-                "last_pushed": i.get("pushed_at"),
-            }
-            for i in items
-        ]
-    elif search_type == "code":
-        results = [
-            {
-                "repo": i.get("repository", {}).get("full_name"),
-                "path": i.get("path"),
-                "url": i.get("html_url"),
-            }
-            for i in items
-        ]
-    else:  # users
-        results = [
-            {"login": i.get("login"), "url": i.get("html_url"), "type": i.get("type")}
-            for i in items
-        ]
+        footer = Footer(intake["device_name"])
+        doc.build(story, onFirstPage=footer, onLaterPages=footer)
 
-    emit({
-        "query": args.query,
-        "type": search_type,
-        "authenticated": bool(token),
-        "total_count": data.get("total_count", len(results)),
-        "results": results[: args.limit],
-    })
+    print(f"  PDF written → {output_path}")
 
 
-# --------------------------------------------------------------------------- #
-# CLI wiring
-# --------------------------------------------------------------------------- #
-
-def build_parser() -> argparse.ArgumentParser:
+# ═══════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════
+def main():
     parser = argparse.ArgumentParser(
-        prog="tech_stack.py",
-        description="Detected technology-stack lookup (BuiltWith + free fallbacks).",
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    p_detect = sub.add_parser("detect", help="Look up a domain's current stack via BuiltWith.")
-    p_detect.add_argument("--domain", required=True, help="e.g. example.com")
-    p_detect.set_defaults(func=cmd_detect)
-
-    p_web = sub.add_parser("web-fallback", help="Free multi-engine web search fallback.")
-    p_web.add_argument("--query", required=True)
-    p_web.add_argument("--limit", type=int, default=5)
-    p_web.add_argument(
-        "--engine",
-        choices=["ddg", "bing", "brave", "mojeek", "google-cse", "all"],
-        default="all",
-    )
-    p_web.set_defaults(func=cmd_web_fallback)
-
-    p_gh = sub.add_parser("github-fallback", help="GitHub search fallback for open-source signal.")
-    p_gh.add_argument("--query", required=True)
-    p_gh.add_argument("--type", choices=["repositories", "code", "users"], default="repositories")
-    p_gh.add_argument("--limit", type=int, default=5)
-    p_gh.set_defaults(func=cmd_github_fallback)
-
-    return parser
-
-
-def main() -> None:
-    parser = build_parser()
+        description="DHF Builder + PDF Exporter (integrated, no subprocess diagrams)")
+    parser.add_argument("--intake", required=True, help="Device intake JSON file")
+    parser.add_argument("--out",    default="DHF_Report.pdf", help="Output PDF path")
     args = parser.parse_args()
-    try:
-        args.func(args)
-    except SystemExit:
-        raise
-    except Exception as exc:  # last-resort guard so failures are always structured JSON
-        emit_error(f"Unhandled error: {exc}", exit_code=99)
+
+    intake = json.loads(Path(args.intake).read_text())
+    print(f"\nDHF Builder → {intake['device_name']}")
+    print(f"Output: {args.out}\n")
+    build_pdf(intake, args.out)
+    print("\nDone.")
 
 
 if __name__ == "__main__":
